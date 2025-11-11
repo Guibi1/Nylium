@@ -1,0 +1,6 @@
+[package]
+name = "corrode-adapter"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]

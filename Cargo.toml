@@ -1,0 +1,20 @@
+[workspace]
+resolver = "3"
+members = ["corrode", "corrode-adapter", "corrode-assets"]
+
+
+[workspace.package]
+version = "0.0.0"
+edition = "2024"
+
+
+[workspace.dependencies]
+gpui = "0.2.2"
+gpui-component = "0.4.0-preview1"
+
+[profile.release]
+lto = true
+codegen-units = 1
+
+[profile.bench]
+debug = true

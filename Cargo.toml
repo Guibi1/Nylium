@@ -1,6 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["corrode", "corrode-adapter", "corrode-assets"]
+members = [
+    "corrode",
+    "corrode-adapter",
+    "corrode-assets",
+    "corrode-ui",
+    "corrode-config-derive",
+]
 
 
 [workspace.package]

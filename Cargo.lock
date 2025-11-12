@@ -1102,7 +1102,9 @@ dependencies = [
 name = "corrode"
 version = "0.0.0"
 dependencies = [
+ "corrode-adapter",
  "corrode-assets",
+ "corrode-ui",
  "gpui",
  "gpui-component",
 ]
@@ -1110,6 +1112,11 @@ dependencies = [
 [[package]]
 name = "corrode-adapter"
 version = "0.0.0"
+dependencies = [
+ "corrode-config-derive",
+ "corrode-ui",
+ "gpui",
+]
 
 [[package]]
 name = "corrode-assets"
@@ -1121,6 +1128,24 @@ dependencies = [
  "quote",
  "rust-embed",
  "syn 2.0.110",
+]
+
+[[package]]
+name = "corrode-config-derive"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.110",
+]
+
+[[package]]
+name = "corrode-ui"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "num-traits",
 ]
 
 [[package]]

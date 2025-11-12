@@ -1,0 +1,9 @@
+[package]
+name = "corrode-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+gpui.workspace = true
+gpui-component.workspace = true
+num-traits = "0.2.19"

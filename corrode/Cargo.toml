@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+corrode-adapter = { path = "../corrode-adapter" }
 corrode-assets = { path = "../corrode-assets" }
+corrode-ui = { path = "../corrode-ui" }
 gpui.workspace = true
 gpui-component.workspace = true

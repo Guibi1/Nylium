@@ -4,3 +4,6 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+corrode-config-derive = { path = "../corrode-config-derive" }
+corrode-ui = { path = "../corrode-ui" }
+gpui.workspace = true

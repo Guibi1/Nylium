@@ -1,6 +1,7 @@
 use gpui::*;
 use gpui_component::Root;
 
+mod pages;
 mod window;
 
 use corrode_assets::CorrodeAssetSource;
@@ -13,8 +14,7 @@ fn main() {
             gpui_component::init(cx);
 
             cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|_| CorrodeWindow);
-                // This first level on the window, should be a Root.
+                let view = cx.new(|cx| CorrodeWindow::new(window, cx));
                 cx.new(|cx| Root::new(view.into(), window, cx))
             })
             .unwrap();

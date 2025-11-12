@@ -3,7 +3,18 @@ use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::{StyledExt, TitleBar};
 
-pub struct CorrodeWindow;
+use crate::pages::SettingsPage;
+
+pub struct CorrodeWindow {
+    settings: Entity<SettingsPage>,
+}
+
+impl CorrodeWindow {
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        let settings = cx.new(|cx| SettingsPage::new(window, cx));
+        Self { settings }
+    }
+}
 
 impl Render for CorrodeWindow {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
@@ -33,7 +44,8 @@ impl Render for CorrodeWindow {
                             .primary()
                             .label("Let's Go!")
                             .on_click(|_, _, _| println!("Clicked!")),
-                    ),
+                    )
+                    .child(self.settings.clone()),
             )
     }
 }

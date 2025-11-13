@@ -1,22 +1,46 @@
-use gpui::*;
-use gpui_component::Root;
+use std::net::SocketAddr;
 
-mod pages;
-mod window;
-
-use corrode_assets::CorrodeAssetSource;
-use window::CorrodeWindow;
+use corrode::Corrode;
+use corrode_adapter::{CorrodeConfig, CorrodeServer};
 
 fn main() {
-    Application::new()
-        .with_assets(CorrodeAssetSource)
-        .run(move |cx| {
-            gpui_component::init(cx);
+    Corrode::new(DummyServer).run();
+}
 
-            cx.open_window(WindowOptions::default(), |window, cx| {
-                let view = cx.new(|cx| CorrodeWindow::new(window, cx));
-                cx.new(|cx| Root::new(view.into(), window, cx))
-            })
-            .unwrap();
-        });
+struct DummyServer;
+
+impl CorrodeServer<DummyConfig> for DummyServer {
+    fn start(&self) {
+        println!("Server started");
+    }
+
+    fn stop(&self) {
+        println!("Server stopped");
+    }
+
+    fn send_command(&self, command: &str) {
+        println!("Command received: {}", command);
+    }
+
+    fn get_config(&self) -> DummyConfig {
+        DummyConfig {
+            server_address: "127.0.0.1:25565".parse().unwrap(),
+            seed: "ExampleSeed".into(),
+            max_players: 20,
+            online_mode: false,
+        }
+    }
+
+    fn update_config(&self, _config: &DummyConfig) -> bool {
+        println!("Config updated");
+        true
+    }
+}
+
+#[derive(CorrodeConfig)]
+pub struct DummyConfig {
+    pub server_address: SocketAddr,
+    pub seed: String,
+    pub max_players: u32,
+    pub online_mode: bool,
 }

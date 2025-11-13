@@ -1,3 +1,4 @@
+use corrode_adapter::config::CorrodeConfig;
 use corrode_assets::Assets;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
@@ -10,8 +11,11 @@ pub struct CorrodeWindow {
 }
 
 impl CorrodeWindow {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let settings = cx.new(|cx| SettingsPage::new(window, cx));
+    pub fn new<C>(window: &mut Window, cx: &mut Context<Self>) -> Self
+    where
+        C: CorrodeConfig,
+    {
+        let settings = cx.new(|cx| SettingsPage::new::<C>(window, cx));
         Self { settings }
     }
 }

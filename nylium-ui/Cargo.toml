@@ -1,5 +1,5 @@
 [package]
-name = "corrode-ui"
+name = "nylium-ui"
 version.workspace = true
 edition.workspace = true
 

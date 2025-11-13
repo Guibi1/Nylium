@@ -1,15 +1,15 @@
 use std::net::SocketAddr;
 
-use corrode::Corrode;
-use corrode_adapter::{CorrodeConfig, CorrodeServer};
+use nylium::Nylium;
+use nylium_adapter::{NyliumConfig, NyliumServer};
 
 fn main() {
-    Corrode::new(DummyServer).run();
+    Nylium::new(DummyServer).run();
 }
 
 struct DummyServer;
 
-impl CorrodeServer<DummyConfig> for DummyServer {
+impl NyliumServer<DummyConfig> for DummyServer {
     fn start(&self) {
         println!("Server started");
     }
@@ -37,7 +37,7 @@ impl CorrodeServer<DummyConfig> for DummyServer {
     }
 }
 
-#[derive(CorrodeConfig)]
+#[derive(NyliumConfig)]
 pub struct DummyConfig {
     pub server_address: SocketAddr,
     pub seed: String,

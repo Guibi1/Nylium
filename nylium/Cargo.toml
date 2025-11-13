@@ -1,0 +1,11 @@
+[package]
+name = "nylium"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+nylium-adapter = { path = "../nylium-adapter" }
+nylium-assets = { path = "../nylium-assets" }
+nylium-ui = { path = "../nylium-ui" }
+gpui.workspace = true
+gpui-component.workspace = true

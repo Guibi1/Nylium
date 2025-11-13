@@ -3,11 +3,11 @@ use std::borrow::Cow;
 
 mod assets;
 
-pub use assets::CorrodeAssetSource;
+pub use assets::NyliumAssetSource;
 
 include!(concat!(env!("OUT_DIR"), "/out.rs"));
 
-impl AssetSource for CorrodeAssetSource {
+impl AssetSource for NyliumAssetSource {
     fn load(&self, path: &str) -> gpui::Result<Option<Cow<'static, [u8]>>> {
         if path.is_empty() {
             return Ok(None);

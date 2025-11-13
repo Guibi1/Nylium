@@ -1,5 +1,5 @@
 [package]
-name = "corrode-assets"
+name = "nylium-assets"
 version.workspace = true
 edition.workspace = true
 build = "build.rs"
@@ -7,10 +7,10 @@ build = "build.rs"
 [dependencies]
 gpui.workspace = true
 gpui-component.workspace = true
-rust-embed = "^8.9.0"
+rust-embed.workspace = true
 
 [build-dependencies]
 prettyplease = "0.2.37"
-quote = "^1.0.42"
-rust-embed = "^8.9.0"
-syn = "2.0.110"
+quote.workspace = true
+rust-embed.workspace = true
+syn.workspace = true

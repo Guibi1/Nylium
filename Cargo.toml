@@ -1,11 +1,11 @@
 [workspace]
 resolver = "3"
 members = [
-    "corrode",
-    "corrode-adapter",
-    "corrode-assets",
-    "corrode-ui",
-    "corrode-config-derive",
+    "nylium",
+    "nylium-adapter",
+    "nylium-assets",
+    "nylium-ui",
+    "nylium-config-derive",
 ]
 
 
@@ -17,10 +17,15 @@ edition = "2024"
 [workspace.dependencies]
 gpui = "0.2.2"
 gpui-component = "0.4.0-preview1"
+quote = "^1.0.42"
+rust-embed = "^8.9.0"
+syn = "2.0.110"
+
 
 [profile.release]
 lto = true
 codegen-units = 1
+
 
 [profile.bench]
 debug = true

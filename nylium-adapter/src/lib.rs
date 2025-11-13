@@ -1,14 +1,14 @@
 pub mod config;
 pub mod gpui;
 
-pub use corrode_config_derive::CorrodeConfig;
-pub use corrode_ui::form as form_ui;
+pub use nylium_config_derive::NyliumConfig;
+pub use nylium_ui::form as form_ui;
 
-use crate::config::CorrodeConfig;
+use crate::config::NyliumConfig;
 
-pub trait CorrodeServer<C>
+pub trait NyliumServer<C>
 where
-    C: CorrodeConfig,
+    C: NyliumConfig,
 {
     fn start(&self);
     fn stop(&self);

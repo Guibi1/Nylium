@@ -1099,56 +1099,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "corrode"
-version = "0.0.0"
-dependencies = [
- "corrode-adapter",
- "corrode-assets",
- "corrode-ui",
- "gpui",
- "gpui-component",
-]
-
-[[package]]
-name = "corrode-adapter"
-version = "0.0.0"
-dependencies = [
- "corrode-config-derive",
- "corrode-ui",
- "gpui",
-]
-
-[[package]]
-name = "corrode-assets"
-version = "0.0.0"
-dependencies = [
- "gpui",
- "gpui-component",
- "prettyplease",
- "quote",
- "rust-embed",
- "syn 2.0.110",
-]
-
-[[package]]
-name = "corrode-config-derive"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.110",
-]
-
-[[package]]
-name = "corrode-ui"
-version = "0.0.0"
-dependencies = [
- "gpui",
- "gpui-component",
- "num-traits",
-]
-
-[[package]]
 name = "cosmic-text"
 version = "0.14.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3664,6 +3614,56 @@ checksum = "91df4bbde75afed763b708b7eee1e8e7651e02d97f6d5dd763e89367e957b23b"
 dependencies = [
  "hermit-abi",
  "libc",
+]
+
+[[package]]
+name = "nylium"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "nylium-adapter",
+ "nylium-assets",
+ "nylium-ui",
+]
+
+[[package]]
+name = "nylium-adapter"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "nylium-config-derive",
+ "nylium-ui",
+]
+
+[[package]]
+name = "nylium-assets"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "prettyplease",
+ "quote",
+ "rust-embed",
+ "syn 2.0.110",
+]
+
+[[package]]
+name = "nylium-config-derive"
+version = "0.0.0"
+dependencies = [
+ "proc-macro2",
+ "quote",
+ "syn 2.0.110",
+]
+
+[[package]]
+name = "nylium-ui"
+version = "0.0.0"
+dependencies = [
+ "gpui",
+ "gpui-component",
+ "num-traits",
 ]
 
 [[package]]

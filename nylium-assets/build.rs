@@ -7,7 +7,7 @@ include!("src/assets.rs");
 fn main() {
     println!("cargo:rerun-if-changed=assets/");
 
-    let (name, path): (Vec<_>, Vec<_>) = CorrodeAssetSource::iter()
+    let (name, path): (Vec<_>, Vec<_>) = NyliumAssetSource::iter()
         .into_iter()
         .filter_map(|asset| {
             let name = asset.split_once("/")?.1.split_once(".")?.0;

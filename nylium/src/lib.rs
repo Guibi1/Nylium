@@ -1,28 +1,28 @@
-use corrode_adapter::CorrodeServer;
-use corrode_adapter::config::CorrodeConfig;
-use corrode_assets::CorrodeAssetSource;
 use gpui::*;
 use gpui_component::{Root, TitleBar};
+use nylium_adapter::NyliumServer;
+use nylium_adapter::config::NyliumConfig;
+use nylium_assets::NyliumAssetSource;
 use std::{marker::PhantomData, sync::Arc};
 
 mod pages;
 mod window;
 
-use crate::window::CorrodeWindow;
+use crate::window::NyliumWindow;
 
-pub struct Corrode<S, C>
+pub struct Nylium<S, C>
 where
-    C: CorrodeConfig,
-    S: CorrodeServer<C> + 'static,
+    C: NyliumConfig,
+    S: NyliumServer<C> + 'static,
 {
     server: Arc<S>,
     _phantom: PhantomData<C>,
 }
 
-impl<S, C> Corrode<S, C>
+impl<S, C> Nylium<S, C>
 where
-    C: CorrodeConfig,
-    S: CorrodeServer<C> + 'static,
+    C: NyliumConfig,
+    S: NyliumServer<C> + 'static,
 {
     pub fn new(server: S) -> Self {
         Self {
@@ -35,7 +35,7 @@ where
         let server = self.server.clone();
 
         Application::new()
-            .with_assets(CorrodeAssetSource)
+            .with_assets(NyliumAssetSource)
             .run(move |cx| {
                 gpui_component::init(cx);
                 cx.set_global(server.get_config());
@@ -55,7 +55,7 @@ where
                     ..Default::default()
                 };
                 cx.open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| CorrodeWindow::new::<C>(window, cx));
+                    let view = cx.new(|cx| NyliumWindow::new::<C>(window, cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 })
                 .unwrap();

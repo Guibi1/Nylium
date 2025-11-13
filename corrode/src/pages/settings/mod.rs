@@ -19,10 +19,12 @@ impl SettingsPage {
 
 impl Render for SettingsPage {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        v_form().children(
-            self.fields
-                .iter()
-                .map(|(name, entity)| form_field().label(name.clone()).child(entity.clone())),
+        div().px_8().py_4().child(
+            v_form().children(
+                self.fields
+                    .iter()
+                    .map(|(name, entity)| form_field().label(name.clone()).child(entity.clone())),
+            ),
         )
     }
 }

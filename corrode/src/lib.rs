@@ -2,7 +2,7 @@ use corrode_adapter::CorrodeServer;
 use corrode_adapter::config::CorrodeConfig;
 use corrode_assets::CorrodeAssetSource;
 use gpui::*;
-use gpui_component::Root;
+use gpui_component::{Root, TitleBar};
 use std::{marker::PhantomData, sync::Arc};
 
 mod pages;
@@ -49,7 +49,12 @@ where
 
                 server.start();
 
-                cx.open_window(WindowOptions::default(), |window, cx| {
+                let window_options = WindowOptions {
+                    titlebar: Some(TitleBar::title_bar_options()),
+                    window_bounds: Some(WindowBounds::centered(size(px(800.), px(500.)), cx)),
+                    ..Default::default()
+                };
+                cx.open_window(window_options, |window, cx| {
                     let view = cx.new(|cx| CorrodeWindow::new::<C>(window, cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 })

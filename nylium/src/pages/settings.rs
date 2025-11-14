@@ -1,5 +1,5 @@
 use gpui::*;
-use gpui_component::form::{form_field, v_form};
+use gpui_component::form::{field, v_form};
 use nylium_adapter::config::NyliumConfig;
 
 pub struct SettingsPage {
@@ -23,7 +23,7 @@ impl Render for SettingsPage {
             v_form().children(
                 self.fields
                     .iter()
-                    .map(|(name, entity)| form_field().label(name.clone()).child(entity.clone())),
+                    .map(|(name, entity)| field().label(name.clone()).child(entity.clone())),
             ),
         )
     }

@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use gpui::Global;
 use nylium::Nylium;
 use nylium_adapter::{NyliumConfig, NyliumServer};
 
@@ -9,6 +10,7 @@ fn main() {
 
 struct DummyServer;
 
+impl Global for DummyServer {}
 impl NyliumServer<DummyConfig> for DummyServer {
     fn start(&self) {
         println!("Server started");

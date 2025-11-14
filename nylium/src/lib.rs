@@ -3,7 +3,7 @@ use gpui_component::{Root, TitleBar};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::NyliumAssetSource;
-use std::{marker::PhantomData, sync::Arc};
+use std::marker::PhantomData;
 
 mod pages;
 mod window;
@@ -15,7 +15,7 @@ where
     C: NyliumConfig,
     S: NyliumServer<C> + 'static,
 {
-    server: Arc<S>,
+    server: S,
     _phantom: PhantomData<C>,
 }
 
@@ -26,28 +26,26 @@ where
 {
     pub fn new(server: S) -> Self {
         Self {
-            server: Arc::new(server),
+            server,
             _phantom: PhantomData,
         }
     }
 
     pub fn run(self) {
-        let server = self.server.clone();
-
         Application::new()
             .with_assets(NyliumAssetSource)
             .run(move |cx| {
                 gpui_component::init(cx);
-                cx.set_global(server.get_config());
+                cx.set_global(self.server.get_config());
+                cx.set_global(self.server);
+
                 cx.observe_global::<C>({
-                    let server = server.clone();
                     move |cx| {
-                        server.update_config(cx.global());
+                        let server = cx.global::<S>();
+                        server.update_config(cx.global::<C>());
                     }
                 })
                 .detach();
-
-                server.start();
 
                 let window_options = WindowOptions {
                     titlebar: Some(TitleBar::title_bar_options()),
@@ -55,10 +53,12 @@ where
                     ..Default::default()
                 };
                 cx.open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| NyliumWindow::new::<C>(window, cx));
+                    let view = cx.new(|cx| NyliumWindow::<S, C>::new(window, cx));
                     cx.new(|cx| Root::new(view.into(), window, cx))
                 })
                 .unwrap();
+
+                cx.global::<S>().start();
             });
     }
 }

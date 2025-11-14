@@ -1,3 +1,5 @@
+use gpui::Global;
+
 pub mod config;
 pub mod gpui;
 
@@ -6,7 +8,7 @@ pub use nylium_ui::form as form_ui;
 
 use crate::config::NyliumConfig;
 
-pub trait NyliumServer<C>
+pub trait NyliumServer<C>: Global
 where
     C: NyliumConfig,
 {

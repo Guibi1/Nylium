@@ -2,31 +2,41 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{StyledExt, TitleBar};
+use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
 
 use crate::pages::{ConsolePage, SettingsPage};
 
-pub struct NyliumWindow {
+pub struct NyliumWindow<S, C>
+where
+    C: NyliumConfig,
+    S: NyliumServer<C> + 'static,
+{
     active_tab: usize,
-    console_page: Entity<ConsolePage>,
+    console_page: Entity<ConsolePage<S, C>>,
     settings_page: Entity<SettingsPage>,
 }
 
-impl NyliumWindow {
-    pub fn new<C>(window: &mut Window, cx: &mut Context<Self>) -> Self
-    where
-        C: NyliumConfig,
-    {
+impl<S, C> NyliumWindow<S, C>
+where
+    C: NyliumConfig,
+    S: NyliumServer<C> + 'static,
+{
+    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             active_tab: 0,
-            console_page: cx.new(|cx| ConsolePage::new::<C>(window, cx)),
+            console_page: cx.new(|cx| ConsolePage::new(window, cx)),
             settings_page: cx.new(|cx| SettingsPage::new::<C>(window, cx)),
         }
     }
 }
 
-impl Render for NyliumWindow {
+impl<S, C> Render for NyliumWindow<S, C>
+where
+    C: NyliumConfig,
+    S: NyliumServer<C> + 'static,
+{
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .v_flex()
@@ -51,8 +61,8 @@ impl Render for NyliumWindow {
                         this.active_tab = *index;
                         cx.notify();
                     }))
-                    .child(Tab::new("Console").prefix(Assets::Terminal).px_2())
-                    .child(Tab::new("Settings").prefix(Assets::Settings).px_2()),
+                    .child(Tab::new().label("Console").prefix(Assets::Terminal).px_2())
+                    .child(Tab::new().label("Settings").prefix(Assets::Settings).px_2()),
             )
             .when(self.active_tab == 0, |this| {
                 this.child(self.console_page.clone())

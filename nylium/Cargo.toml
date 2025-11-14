@@ -4,8 +4,11 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+gag = "1.0.0"
+gpui.workspace = true
+gpui-component.workspace = true
+
 nylium-adapter = { path = "../nylium-adapter" }
 nylium-assets = { path = "../nylium-assets" }
 nylium-ui = { path = "../nylium-ui" }
-gpui.workspace = true
-gpui-component.workspace = true
+smol = "2.0.2"

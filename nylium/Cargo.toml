@@ -5,10 +5,12 @@ edition.workspace = true
 
 [dependencies]
 gag = "1.0.0"
+smol = "2.0.2"
+
+async-trait.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
 
 nylium-adapter = { path = "../nylium-adapter" }
 nylium-assets = { path = "../nylium-assets" }
 nylium-ui = { path = "../nylium-ui" }
-smol = "2.0.2"

@@ -3630,6 +3630,7 @@ dependencies = [
 name = "nylium"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "gag",
  "gpui",
  "gpui-component",
@@ -3643,6 +3644,7 @@ dependencies = [
 name = "nylium-adapter"
 version = "0.0.0"
 dependencies = [
+ "async-trait",
  "gpui",
  "nylium-config-derive",
  "nylium-ui",

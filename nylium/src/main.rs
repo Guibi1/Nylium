@@ -1,5 +1,6 @@
 use std::net::SocketAddr;
 
+use async_trait::async_trait;
 use gpui::Global;
 use nylium::Nylium;
 use nylium_adapter::{NyliumConfig, NyliumServer};
@@ -8,15 +9,18 @@ fn main() {
     Nylium::new(DummyServer).run();
 }
 
+#[derive(Clone)]
 struct DummyServer;
 
 impl Global for DummyServer {}
+
+#[async_trait]
 impl NyliumServer<DummyConfig> for DummyServer {
-    fn start(&self) {
+    async fn start(&self) {
         println!("Server started");
     }
 
-    fn stop(&self) {
+    async fn stop(&self) {
         println!("Server stopped");
     }
 

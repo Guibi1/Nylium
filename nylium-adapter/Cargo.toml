@@ -4,6 +4,8 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
+async-trait.workspace = true
+gpui.workspace = true
+
 nylium-config-derive = { path = "../nylium-config-derive" }
 nylium-ui = { path = "../nylium-ui" }
-gpui.workspace = true

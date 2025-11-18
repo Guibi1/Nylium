@@ -15,6 +15,7 @@ edition = "2024"
 
 
 [workspace.dependencies]
+async-trait = "^0.1.89"
 gpui = "^0.2.2"
 gpui-component = "^0.4.0-preview2"
 quote = "^1.0.42"

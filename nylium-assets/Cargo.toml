@@ -11,6 +11,7 @@ rust-embed.workspace = true
 
 [build-dependencies]
 prettyplease = "0.2.37"
+
 quote.workspace = true
 rust-embed.workspace = true
 syn.workspace = true

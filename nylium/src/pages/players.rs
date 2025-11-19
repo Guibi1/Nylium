@@ -67,7 +67,7 @@ where
             .when_none(&self.players, |this| {
                 this.items_center()
                     .justify_center()
-                    .child(Spinner::new().icon(Assets::LoaderCircle).large())
+                    .child(Spinner::new().large())
             })
             .when_some(self.players.as_ref(), |this, players| {
                 this.children(players.iter().map(|player| {

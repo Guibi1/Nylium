@@ -4,7 +4,9 @@ use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu};
-use gpui_component::{ActiveTheme, StyledExt};
+use gpui_component::skeleton::Skeleton;
+use gpui_component::spinner::Spinner;
+use gpui_component::{Sizable, StyledExt};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
@@ -53,7 +55,7 @@ where
     C: NyliumConfig,
     S: NyliumServer<C> + 'static,
 {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
@@ -62,11 +64,16 @@ where
             .py_4()
             .gap_2()
             .scrollable(Axis::Vertical)
-            .when_none(&self.players, |this| this.child(div().child("Loading")))
+            .when_none(&self.players, |this| {
+                this.items_center()
+                    .justify_center()
+                    .child(Spinner::new().icon(Assets::LoaderCircle).large())
+            })
             .when_some(self.players.as_ref(), |this, players| {
                 this.children(players.iter().map(|player| {
                     div()
                         .w_full()
+                        .flex_grow()
                         .flex()
                         .gap_2()
                         .py_2()
@@ -74,9 +81,17 @@ where
                         .items_center()
                         .context_menu(create_player_menu)
                         .child(
-                            img(format!("https://api.mineatar.io/face/{}", player.id))
+                            div()
+                                .relative()
                                 .size_6()
-                                .bg(cx.theme().muted),
+                                .overflow_hidden()
+                                .child(Skeleton::new().absolute().inset_0().size_full())
+                                .child(
+                                    img(format!("https://api.mineatar.io/face/{}", player.id))
+                                        .absolute()
+                                        .inset_0()
+                                        .size_full(),
+                                ),
                         )
                         .child(div().flex_grow().child(SharedString::from(&player.name)))
                         .child(

@@ -1,5 +1,5 @@
 [package]
-name = "nylium-ui"
+name = "nylium-shared"
 version.workspace = true
 edition.workspace = true
 
@@ -8,3 +8,4 @@ num-traits = "0.2.19"
 
 gpui.workspace = true
 gpui-component.workspace = true
+uuid.workspace = true

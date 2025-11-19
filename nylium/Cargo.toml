@@ -5,12 +5,15 @@ edition.workspace = true
 
 [dependencies]
 gag = "1.0.0"
+reqwest = { version = "0.12.24", features = ["stream"] }
 smol = "2.0.2"
+tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread"] }
 
 async-trait.workspace = true
 gpui.workspace = true
 gpui-component.workspace = true
+uuid.workspace = true
 
 nylium-adapter = { path = "../nylium-adapter" }
 nylium-assets = { path = "../nylium-assets" }
-nylium-ui = { path = "../nylium-ui" }
+nylium-shared = { path = "../nylium-shared" }

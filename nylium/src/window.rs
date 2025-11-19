@@ -6,7 +6,7 @@ use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
 
-use crate::pages::{ConsolePage, SettingsPage};
+use crate::pages::{ConsolePage, PlayersPage, SettingsPage};
 
 pub struct NyliumWindow<S, C>
 where
@@ -15,6 +15,7 @@ where
 {
     active_tab: usize,
     console_page: Entity<ConsolePage<S, C>>,
+    players_page: Entity<PlayersPage<S, C>>,
     settings_page: Entity<SettingsPage>,
 }
 
@@ -27,6 +28,7 @@ where
         Self {
             active_tab: 0,
             console_page: cx.new(|cx| ConsolePage::new(window, cx)),
+            players_page: cx.new(|cx| PlayersPage::new(window, cx)),
             settings_page: cx.new(|cx| SettingsPage::new::<C>(window, cx)),
         }
     }
@@ -62,12 +64,16 @@ where
                         cx.notify();
                     }))
                     .child(Tab::new().label("Console").prefix(Assets::Terminal).px_2())
+                    .child(Tab::new().label("Players").prefix(Assets::Users).px_2())
                     .child(Tab::new().label("Settings").prefix(Assets::Settings).px_2()),
             )
             .when(self.active_tab == 0, |this| {
                 this.child(self.console_page.clone())
             })
             .when(self.active_tab == 1, |this| {
+                this.child(self.players_page.clone())
+            })
+            .when(self.active_tab == 2, |this| {
                 this.child(self.settings_page.clone())
             })
     }

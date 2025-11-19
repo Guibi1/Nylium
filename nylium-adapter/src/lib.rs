@@ -5,7 +5,8 @@ pub mod gpui;
 
 pub use gpui::Global;
 pub use nylium_config_derive::NyliumConfig;
-pub use nylium_ui::form as form_ui;
+pub use nylium_shared::form as form_ui;
+pub use nylium_shared::objects::Player;
 
 use crate::config::NyliumConfig;
 
@@ -16,8 +17,10 @@ where
 {
     async fn start(&self);
     async fn stop(&self);
-    fn send_command(&self, command: &str);
 
     fn get_config(&self) -> C;
     fn update_config(&self, config: &C) -> bool;
+
+    async fn send_command(&self, command: &str);
+    async fn get_players(&self) -> Vec<Player>;
 }

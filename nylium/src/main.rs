@@ -1,9 +1,11 @@
 use std::net::SocketAddr;
+use std::str::FromStr;
 
 use async_trait::async_trait;
 use gpui::Global;
 use nylium::Nylium;
-use nylium_adapter::{NyliumConfig, NyliumServer};
+use nylium_adapter::{NyliumConfig, NyliumServer, Player};
+use uuid::Uuid;
 
 fn main() {
     Nylium::new(DummyServer).run();
@@ -24,10 +26,6 @@ impl NyliumServer<DummyConfig> for DummyServer {
         println!("Server stopped");
     }
 
-    fn send_command(&self, command: &str) {
-        println!("Command received: {}", command);
-    }
-
     fn get_config(&self) -> DummyConfig {
         DummyConfig {
             server_address: "127.0.0.1:25565".parse().unwrap(),
@@ -40,6 +38,17 @@ impl NyliumServer<DummyConfig> for DummyServer {
     fn update_config(&self, _config: &DummyConfig) -> bool {
         println!("Config updated");
         true
+    }
+
+    async fn send_command(&self, command: &str) {
+        println!("Command received: {}", command);
+    }
+
+    async fn get_players(&self) -> Vec<Player> {
+        vec![Player {
+            id: Uuid::from_str("0939003b-c550-4914-a461-09b5bb0c80ea").unwrap(),
+            name: "Guibi1".to_string(),
+        }]
     }
 }
 

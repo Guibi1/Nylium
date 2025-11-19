@@ -1,13 +1,17 @@
+use std::marker::PhantomData;
+use std::sync::Arc;
+
 use gpui::*;
 use gpui_component::{Root, TitleBar};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::NyliumAssetSource;
-use std::marker::PhantomData;
 
+mod http_client;
 mod pages;
 mod window;
 
+use crate::http_client::ReqwestClient;
 use crate::window::NyliumWindow;
 
 pub struct Nylium<S, C>
@@ -34,17 +38,17 @@ where
     pub fn run(self) {
         Application::new()
             .with_assets(NyliumAssetSource)
+            .with_http_client(Arc::new(ReqwestClient::new()))
             .run(move |cx| {
                 gpui_component::init(cx);
+
                 cx.set_global(self.server.get_config());
                 cx.set_global(self.server);
 
                 // Update config when changed
-                cx.observe_global::<C>({
-                    move |cx| {
-                        let server = cx.global::<S>();
-                        server.update_config(cx.global::<C>());
-                    }
+                cx.observe_global::<C>(|cx| {
+                    let server = cx.global::<S>();
+                    server.update_config(cx.global::<C>());
                 })
                 .detach();
 
@@ -68,11 +72,9 @@ where
                 .unwrap();
 
                 // Start server
+                let server = cx.global::<S>().clone();
                 cx.background_executor()
-                    .spawn({
-                        let server = cx.global::<S>().clone();
-                        async move { server.start().await }
-                    })
+                    .spawn(async move { server.start().await })
                     .detach();
             });
     }

@@ -49,7 +49,9 @@ where
                         Some(cmd)
                     });
                     if let Some(cmd) = cmd {
-                        cx.global::<S>().send_command(&cmd);
+                        let server = cx.global::<S>().clone();
+                        cx.background_spawn(async move { server.send_command(&cmd).await })
+                            .detach();
                     }
                 }
             },
@@ -100,7 +102,9 @@ where
                                 Some(cmd)
                             });
                             if let Some(cmd) = cmd {
-                                cx.global::<S>().send_command(&cmd);
+                                let server = cx.global::<S>().clone();
+                                cx.background_spawn(async move { server.send_command(&cmd).await })
+                                    .detach();
                             }
                         })),
                 ),

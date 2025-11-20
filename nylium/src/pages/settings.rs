@@ -1,4 +1,5 @@
 use gpui::*;
+use gpui_component::StyledExt;
 use gpui_component::form::{field, v_form};
 use nylium_adapter::config::NyliumConfig;
 
@@ -19,11 +20,13 @@ impl SettingsPage {
 
 impl Render for SettingsPage {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().flex_col().px_8().py_4().gap_2().child(
-            v_form().children(
-                self.fields
-                    .iter()
-                    .map(|(name, entity)| field().label(name.clone()).child(entity.clone())),
+        div().flex().flex_col().gap_2().overflow_hidden().child(
+            div().px_8().py_4().scrollable(Axis::Vertical).child(
+                v_form().children(
+                    self.fields
+                        .iter()
+                        .map(|(name, entity)| field().label(name.clone()).child(entity.clone())),
+                ),
             ),
         )
     }

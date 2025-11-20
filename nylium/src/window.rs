@@ -6,6 +6,7 @@ use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
 
+use crate::logger::NyliumLogger;
 use crate::pages::{ConsolePage, PlayersPage, SettingsPage};
 
 pub struct NyliumWindow<S, C>
@@ -24,10 +25,10 @@ where
     C: NyliumConfig,
     S: NyliumServer<C> + 'static,
 {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    pub fn new(logger: NyliumLogger, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             active_tab: 0,
-            console_page: cx.new(|cx| ConsolePage::new(window, cx)),
+            console_page: cx.new(|cx| ConsolePage::new(logger, window, cx)),
             players_page: cx.new(|cx| PlayersPage::new(window, cx)),
             settings_page: cx.new(|cx| SettingsPage::new::<C>(window, cx)),
         }
@@ -41,7 +42,8 @@ where
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
-            .v_flex()
+            .flex()
+            .flex_col()
             .size_full()
             .child(
                 TitleBar::new().child(

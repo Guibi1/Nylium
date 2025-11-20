@@ -3,12 +3,13 @@ use std::str::FromStr;
 
 use async_trait::async_trait;
 use gpui::Global;
-use nylium::Nylium;
+use nylium::{Nylium, NyliumLogger};
 use nylium_adapter::{NyliumConfig, NyliumServer, Player};
 use uuid::Uuid;
 
 fn main() {
-    Nylium::new(DummyServer).run();
+    let logger = NyliumLogger::init();
+    Nylium::new(DummyServer, logger).run();
 }
 
 #[derive(Clone)]

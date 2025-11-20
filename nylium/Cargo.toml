@@ -4,7 +4,9 @@ version.workspace = true
 edition.workspace = true
 
 [dependencies]
-gag = "1.0.0"
+chrono = "0.4.42"
+env_logger = "0.11.8"
+log = "0.4.28"
 reqwest = { version = "0.12.24", features = ["stream"] }
 smol = "2.0.2"
 tokio = { version = "1.48.0", features = ["rt", "rt-multi-thread"] }

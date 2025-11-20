@@ -1,6 +1,4 @@
-use std::io::BufRead;
 use std::marker::PhantomData;
-use std::time::Duration;
 
 use gpui::*;
 use gpui_component::Sizable;
@@ -9,6 +7,8 @@ use gpui_component::input::{Input, InputEvent, InputState};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
+
+use crate::logger::NyliumLogger;
 
 pub struct ConsolePage<S, C>
 where
@@ -26,9 +26,7 @@ where
     C: NyliumConfig,
     S: NyliumServer<C> + 'static,
 {
-    pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        redirect_stdout(cx.entity(), window, cx).detach();
-
+    pub fn new(logger: NyliumLogger, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let command_state = cx.new(|cx| {
             InputState::new(window, cx)
                 .clean_on_escape()
@@ -58,14 +56,35 @@ where
         )
         .detach();
 
+        let logs_state = cx.new(|cx| {
+            InputState::new(window, cx)
+                .multi_line()
+                .soft_wrap(true)
+                .searchable(true)
+        });
+
+        let window_handle = window.window_handle();
+        cx.spawn(
+            move |this: WeakEntity<ConsolePage<S, C>>, cx: &mut AsyncApp| {
+                let mut cx = cx.clone();
+                async move {
+                    while logger.wait_for_log().await {
+                        let _ = window_handle.update(&mut cx, |_, window, cx| {
+                            let _ = this.update(&mut *cx, |this, cx| {
+                                this.logs_state.update(cx, |logs_state, cx| {
+                                    logs_state.set_value(logger.get_logs(), window, cx);
+                                });
+                            });
+                        });
+                    }
+                }
+            },
+        )
+        .detach();
+
         Self {
             command_state,
-            logs_state: cx.new(|cx| {
-                InputState::new(window, cx)
-                    .multi_line()
-                    .soft_wrap(true)
-                    .searchable(true)
-            }),
+            logs_state,
             _phantoms: PhantomData,
             _phantomc: PhantomData,
         }
@@ -110,51 +129,4 @@ where
                 ),
             )
     }
-}
-
-fn redirect_stdout<S, C>(page: Entity<ConsolePage<S, C>>, window: &mut Window, cx: &App) -> Task<()>
-where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
-{
-    let window_handle = window.window_handle();
-    let (tx, rx) = smol::channel::bounded::<String>(3);
-
-    cx.spawn(move |cx: &mut AsyncApp| {
-        let mut cx = cx.clone();
-        async move {
-            while let Ok(line) = rx.recv().await {
-                window_handle
-                    .update(&mut cx, |_, window, cx| {
-                        page.update(&mut *cx, |page, cx| {
-                            page.logs_state.update(cx, |logs_state, cx| {
-                                let logs = logs_state.value();
-                                logs_state.set_value(logs.to_string() + &line, window, cx);
-                            });
-                        });
-                    })
-                    .unwrap();
-            }
-        }
-    })
-    .detach();
-
-    cx.background_spawn(async move {
-        let redirect = gag::BufferRedirect::stdout().unwrap();
-        let mut reader = std::io::BufReader::new(redirect);
-        let mut line = String::new();
-        loop {
-            line.clear();
-            match reader.read_line(&mut line) {
-                Ok(len) => {
-                    if len == 0 {
-                        smol::Timer::after(Duration::from_millis(10)).await;
-                    } else {
-                        let _ = tx.send(line.clone()).await;
-                    }
-                }
-                Err(_) => break,
-            }
-        }
-    })
 }

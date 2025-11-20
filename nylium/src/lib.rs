@@ -8,11 +8,14 @@ use nylium_adapter::config::NyliumConfig;
 use nylium_assets::NyliumAssetSource;
 
 mod http_client;
+mod logger;
 mod pages;
 mod window;
 
 use crate::http_client::ReqwestClient;
 use crate::window::NyliumWindow;
+
+pub use crate::logger::NyliumLogger;
 
 pub struct Nylium<S, C>
 where
@@ -20,6 +23,7 @@ where
     S: NyliumServer<C>,
 {
     server: S,
+    logger: NyliumLogger,
     _phantom: PhantomData<C>,
 }
 
@@ -28,9 +32,10 @@ where
     C: NyliumConfig,
     S: NyliumServer<C>,
 {
-    pub fn new(server: S) -> Self {
+    pub fn new(server: S, logger: NyliumLogger) -> Self {
         Self {
             server,
+            logger,
             _phantom: PhantomData,
         }
     }
@@ -66,7 +71,7 @@ where
                     ..Default::default()
                 };
                 cx.open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| NyliumWindow::<S, C>::new(window, cx));
+                    let view = cx.new(|cx| NyliumWindow::<S, C>::new(self.logger, window, cx));
                     cx.new(|cx| Root::new(AnyView::from(view), window, cx))
                 })
                 .unwrap();

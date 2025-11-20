@@ -76,7 +76,7 @@ where
                         .flex_grow()
                         .flex()
                         .gap_2()
-                        .py_2()
+                        .py_0p5()
                         .px_4()
                         .items_center()
                         .context_menu(create_player_menu)

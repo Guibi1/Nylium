@@ -46,10 +46,11 @@ impl NyliumServer<DummyConfig> for DummyServer {
     }
 
     async fn get_players(&self) -> Vec<Player> {
-        vec![Player {
-            id: Uuid::from_str("0939003b-c550-4914-a461-09b5bb0c80ea").unwrap(),
-            name: "Guibi1".to_string(),
-        }]
+        vec![Player::new(
+            Uuid::from_str("0939003b-c550-4914-a461-09b5bb0c80ea").unwrap(),
+            "Guibi1",
+            true,
+        )]
     }
 }
 

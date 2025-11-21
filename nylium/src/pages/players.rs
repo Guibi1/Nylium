@@ -3,19 +3,17 @@ use std::marker::PhantomData;
 use gpui::prelude::FluentBuilder;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariant, ButtonVariants};
+use gpui_component::label::Label;
 use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
-use gpui_component::{Sizable, StyledExt};
+use gpui_component::{ActiveTheme, Sizable, StyledExt};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
 use nylium_shared::objects::Player;
 
-actions!(
-    player_options,
-    [CopyPlayer, OpPlayer, KickPlayer, BanPlayer]
-);
+actions!(player, [CopyUuid, Op, Kick, Ban]);
 
 pub struct PlayersPage<S, C>
 where
@@ -33,14 +31,7 @@ where
     S: NyliumServer<C> + 'static,
 {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let server = cx.global::<S>().clone();
-        cx.spawn(async move |this, cx| {
-            let players = cx
-                .background_spawn(async move { server.get_players().await })
-                .await;
-            let _ = this.update(cx, |this, _cx| this.players = Some(players));
-        })
-        .detach();
+        load_players(cx);
 
         Self {
             players: None,
@@ -55,7 +46,7 @@ where
     C: NyliumConfig,
     S: NyliumServer<C> + 'static,
 {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
             .flex()
@@ -64,6 +55,20 @@ where
             .py_4()
             .gap_2()
             .scrollable(Axis::Vertical)
+            .child(
+                div()
+                    .flex()
+                    .flex_row()
+                    .justify_between()
+                    .items_center()
+                    .child(Label::new("Player list").text_xl())
+                    .child(
+                        Button::new("reload")
+                            .icon(Assets::Rotate)
+                            .ghost()
+                            .on_click(cx.listener(|_, _, _, cx| load_players(cx))),
+                    ),
+            )
             .when_none(&self.players, |this| {
                 this.items_center()
                     .justify_center()
@@ -79,6 +84,31 @@ where
                         .py_0p5()
                         .px_4()
                         .items_center()
+                        .hover(|this| this.bg(cx.theme().muted))
+                        .on_action::<CopyUuid>({
+                            let id = player.id;
+                            move |_, _, cx| {
+                                cx.write_to_clipboard(ClipboardItem::new_string(id.to_string()));
+                            }
+                        })
+                        .on_action::<Op>({
+                            let name = player.name.clone();
+                            move |_, _, cx| {
+                                let _ = cx.global::<S>().send_command(&format!("op {}", name));
+                            }
+                        })
+                        .on_action::<Kick>({
+                            let name = player.name.clone();
+                            move |_, _, cx| {
+                                let _ = cx.global::<S>().send_command(&format!("kick {}", name));
+                            }
+                        })
+                        .on_action::<Ban>({
+                            let name = player.name.clone();
+                            move |_, _, cx| {
+                                let _ = cx.global::<S>().send_command(&format!("ban {}", name));
+                            }
+                        })
                         .context_menu(create_player_menu)
                         .child(
                             div()
@@ -93,11 +123,26 @@ where
                                         .size_full(),
                                 ),
                         )
-                        .child(div().flex_grow().child(SharedString::from(&player.name)))
+                        .child(
+                            div()
+                                .flex_grow()
+                                .flex()
+                                .flex_row()
+                                .items_center()
+                                .gap_1()
+                                .child(Label::new(&player.name))
+                                .when(player.online, |this| {
+                                    this.child(
+                                        Label::new("Offline")
+                                            .text_xs()
+                                            .text_color(cx.theme().muted_foreground),
+                                    )
+                                }),
+                        )
                         .child(
                             Button::new("btn")
                                 .icon(Assets::Ellipsis)
-                                .with_variant(ButtonVariant::Ghost)
+                                .with_variant(ButtonVariant::Link)
                                 .dropdown_menu(create_player_menu),
                         )
                 }))
@@ -105,14 +150,29 @@ where
     }
 }
 
+fn load_players<S, C>(cx: &mut Context<PlayersPage<S, C>>)
+where
+    C: NyliumConfig,
+    S: NyliumServer<C> + 'static,
+{
+    cx.spawn(async move |this, cx| {
+        let server = cx.read_global::<S, S>(|s, _| s.clone()).unwrap();
+        let players = cx
+            .background_spawn(async move { server.get_players().await })
+            .await;
+        let _ = this.update(cx, |this, _cx| this.players = Some(players));
+    })
+    .detach();
+}
+
 fn create_player_menu(
     menu: PopupMenu,
     _window: &mut Window,
     _cx: &mut Context<PopupMenu>,
 ) -> PopupMenu {
-    menu.menu("Copy name", Box::new(CopyPlayer))
-        .menu("Kick", Box::new(KickPlayer))
+    menu.menu("Copy Uuid", Box::new(CopyUuid))
+        .menu("OP", Box::new(Op))
         .separator()
-        .menu("OP", Box::new(OpPlayer))
-        .menu("Ban", Box::new(BanPlayer))
+        .menu("Kick", Box::new(Kick))
+        .menu("Ban", Box::new(Ban))
 }

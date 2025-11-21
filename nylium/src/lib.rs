@@ -12,7 +12,7 @@ mod logger;
 mod pages;
 mod window;
 
-use crate::http_client::ReqwestClient;
+use crate::http_client::HttpClient;
 use crate::window::NyliumWindow;
 
 pub use crate::logger::NyliumLogger;
@@ -43,7 +43,7 @@ where
     pub fn run(self) {
         Application::new()
             .with_assets(NyliumAssetSource)
-            .with_http_client(Arc::new(ReqwestClient::new()))
+            .with_http_client(Arc::new(HttpClient::new()))
             .run(move |cx| {
                 gpui_component::init(cx);
 

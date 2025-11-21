@@ -41,7 +41,7 @@ impl NyliumServer<DummyConfig> for DummyServer {
         true
     }
 
-    async fn send_command(&self, command: &str) {
+    async fn run_command(&self, command: &str) {
         println!("Command received: {}", command);
     }
 

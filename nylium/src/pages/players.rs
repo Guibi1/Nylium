@@ -94,19 +94,19 @@ where
                         .on_action::<Op>({
                             let name = player.name.clone();
                             move |_, _, cx| {
-                                let _ = cx.global::<S>().send_command(&format!("op {}", name));
+                                cx.global::<S>().send_command(cx, format!("op {}", name));
                             }
                         })
                         .on_action::<Kick>({
                             let name = player.name.clone();
                             move |_, _, cx| {
-                                let _ = cx.global::<S>().send_command(&format!("kick {}", name));
+                                cx.global::<S>().send_command(cx, format!("kick {}", name));
                             }
                         })
                         .on_action::<Ban>({
                             let name = player.name.clone();
                             move |_, _, cx| {
-                                let _ = cx.global::<S>().send_command(&format!("ban {}", name));
+                                cx.global::<S>().send_command(cx, format!("ban {}", name));
                             }
                         })
                         .context_menu(create_player_menu)

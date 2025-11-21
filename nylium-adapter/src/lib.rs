@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use gpui::{App, AppContext, SharedString};
 
 pub mod config;
 pub mod gpui;
@@ -21,6 +22,13 @@ where
     fn get_config(&self) -> C;
     fn update_config(&self, config: &C) -> bool;
 
-    async fn send_command(&self, command: &str);
+    async fn run_command(&self, command: &str);
     async fn get_players(&self) -> Vec<Player>;
+
+    fn send_command(&self, cx: &App, command: impl Into<SharedString>) {
+        let server = self.clone();
+        let command = command.into();
+        cx.background_spawn(async move { server.run_command(&command).await })
+            .detach();
+    }
 }

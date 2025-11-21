@@ -46,10 +46,8 @@ where
                         console_state.set_value("", window, cx);
                         Some(cmd)
                     });
-                    if let Some(cmd) = cmd {
-                        let server = cx.global::<S>().clone();
-                        cx.background_spawn(async move { server.send_command(&cmd).await })
-                            .detach();
+                    if let Some(command) = cmd {
+                        cx.global::<S>().send_command(cx, command);
                     }
                 }
             },
@@ -120,10 +118,8 @@ where
                                 console_state.set_value("", window, cx);
                                 Some(cmd)
                             });
-                            if let Some(cmd) = cmd {
-                                let server = cx.global::<S>().clone();
-                                cx.background_spawn(async move { server.send_command(&cmd).await })
-                                    .detach();
+                            if let Some(command) = cmd {
+                                cx.global::<S>().send_command(cx, command);
                             }
                         })),
                 ),

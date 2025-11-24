@@ -18,4 +18,3 @@ uuid.workspace = true
 
 nylium-adapter = { path = "../nylium-adapter" }
 nylium-assets = { path = "../nylium-assets" }
-nylium-shared = { path = "../nylium-shared" }

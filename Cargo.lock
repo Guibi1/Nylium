@@ -3846,7 +3846,6 @@ dependencies = [
  "log",
  "nylium-adapter",
  "nylium-assets",
- "nylium-shared",
  "reqwest",
  "smol",
  "uuid",
@@ -3858,8 +3857,6 @@ version = "0.0.0"
 dependencies = [
  "async-trait",
  "gpui",
- "nylium-config-derive",
- "nylium-shared",
  "uuid",
 ]
 
@@ -3873,25 +3870,6 @@ dependencies = [
  "quote",
  "rust-embed",
  "syn 2.0.110",
-]
-
-[[package]]
-name = "nylium-config-derive"
-version = "0.0.0"
-dependencies = [
- "proc-macro2",
- "quote",
- "syn 2.0.110",
-]
-
-[[package]]
-name = "nylium-shared"
-version = "0.0.0"
-dependencies = [
- "gpui",
- "gpui-component",
- "num-traits",
- "uuid",
 ]
 
 [[package]]

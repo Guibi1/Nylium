@@ -2,25 +2,21 @@ use async_trait::async_trait;
 use gpui::{App, AppContext, SharedString};
 
 pub mod config;
-pub mod gpui;
+mod player;
 
+pub use crate::player::Player;
 pub use gpui::Global;
-pub use nylium_config_derive::NyliumConfig;
-pub use nylium_shared::form as form_ui;
-pub use nylium_shared::objects::Player;
 
-use crate::config::NyliumConfig;
+use crate::config::{ConfigOptions, ConfigValue};
 
 #[async_trait]
-pub trait NyliumServer<C>: Clone + Send + Global
-where
-    C: NyliumConfig,
-{
+pub trait NyliumServer<C: Copy>: Clone + Send + Global {
     async fn start(&self);
     async fn stop(&self);
 
-    fn get_config(&self) -> C;
-    fn update_config(&self, config: &C) -> bool;
+    fn get_config(&self) -> Box<[ConfigOptions<C>]>;
+    fn get_config_value(&self, key: C) -> ConfigValue;
+    fn set_config_value(&self, key: C, value: ConfigValue);
 
     async fn run_command(&self, command: &str);
     async fn get_players(&self) -> Vec<Player>;

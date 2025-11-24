@@ -3,26 +3,25 @@ use gpui::*;
 use gpui_component::tab::{Tab, TabBar};
 use gpui_component::{StyledExt, TitleBar};
 use nylium_adapter::NyliumServer;
-use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
 
 use crate::logger::NyliumLogger;
-use crate::pages::{ConsolePage, PlayersPage, SettingsPage};
+use crate::ui::pages::{ConsolePage, PlayersPage, SettingsPage};
 
 pub struct NyliumWindow<S, C>
 where
-    C: NyliumConfig,
+    C: Copy,
     S: NyliumServer<C> + 'static,
 {
     active_tab: usize,
     console_page: Entity<ConsolePage<S, C>>,
     players_page: Entity<PlayersPage<S, C>>,
-    settings_page: Entity<SettingsPage>,
+    settings_page: Entity<SettingsPage<S, C>>,
 }
 
 impl<S, C> NyliumWindow<S, C>
 where
-    C: NyliumConfig,
+    C: Copy + 'static,
     S: NyliumServer<C> + 'static,
 {
     pub fn new(logger: NyliumLogger, window: &mut Window, cx: &mut Context<Self>) -> Self {
@@ -30,14 +29,14 @@ where
             active_tab: 0,
             console_page: cx.new(|cx| ConsolePage::new(logger, window, cx)),
             players_page: cx.new(|cx| PlayersPage::new(window, cx)),
-            settings_page: cx.new(|cx| SettingsPage::new::<C>(window, cx)),
+            settings_page: cx.new(|cx| SettingsPage::new(window, cx)),
         }
     }
 }
 
 impl<S, C> Render for NyliumWindow<S, C>
 where
-    C: NyliumConfig,
+    C: Copy + 'static,
     S: NyliumServer<C> + 'static,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {

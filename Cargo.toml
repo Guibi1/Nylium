@@ -4,8 +4,6 @@ members = [
     "nylium",
     "nylium-adapter",
     "nylium-assets",
-    "nylium-shared",
-    "nylium-config-derive",
 ]
 
 

@@ -8,17 +8,15 @@ use gpui_component::menu::{ContextMenuExt, DropdownMenu, PopupMenu};
 use gpui_component::skeleton::Skeleton;
 use gpui_component::spinner::Spinner;
 use gpui_component::{ActiveTheme, Sizable, StyledExt};
-use nylium_adapter::NyliumServer;
-use nylium_adapter::config::NyliumConfig;
+use nylium_adapter::{NyliumServer, Player};
 use nylium_assets::Assets;
-use nylium_shared::objects::Player;
 
 actions!(player, [CopyUuid, Op, Kick, Ban]);
 
 pub struct PlayersPage<S, C>
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy,
+    S: NyliumServer<C>,
 {
     players: Option<Vec<Player>>,
     _phantoms: PhantomData<S>,
@@ -27,8 +25,8 @@ where
 
 impl<S, C> PlayersPage<S, C>
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy + 'static,
+    S: NyliumServer<C>,
 {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         load_players(cx);
@@ -43,8 +41,8 @@ where
 
 impl<S, C> Render for PlayersPage<S, C>
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy + 'static,
+    S: NyliumServer<C>,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -152,8 +150,8 @@ where
 
 fn load_players<S, C>(cx: &mut Context<PlayersPage<S, C>>)
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy + 'static,
+    S: NyliumServer<C>,
 {
     cx.spawn(async move |this, cx| {
         let server = cx.read_global::<S, S>(|s, _| s.clone()).unwrap();

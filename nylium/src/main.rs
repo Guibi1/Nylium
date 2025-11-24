@@ -1,10 +1,10 @@
-use std::net::SocketAddr;
 use std::str::FromStr;
 
 use async_trait::async_trait;
 use gpui::Global;
 use nylium::{Nylium, NyliumLogger};
-use nylium_adapter::{NyliumConfig, NyliumServer, Player};
+use nylium_adapter::config::{ConfigOptions, ConfigValue};
+use nylium_adapter::{NyliumServer, Player};
 use uuid::Uuid;
 
 fn main() {
@@ -27,18 +27,26 @@ impl NyliumServer<DummyConfig> for DummyServer {
         println!("Server stopped");
     }
 
-    fn get_config(&self) -> DummyConfig {
-        DummyConfig {
-            server_address: "127.0.0.1:25565".parse().unwrap(),
-            seed: "ExampleSeed".into(),
-            max_players: 20,
-            online_mode: false,
+    fn get_config(&self) -> Box<[ConfigOptions<DummyConfig>]> {
+        Box::new([
+            ConfigOptions::new_number(DummyConfig::Port, "Port", Some(1024), Some(65535)),
+            ConfigOptions::new_string(DummyConfig::Seed, "Seed"),
+            ConfigOptions::new_number(DummyConfig::MaxPlayers, "Max Players", Some(1), Some(100)),
+            ConfigOptions::new_bool(DummyConfig::OnlineMode, "Online Mode", "online-mode"),
+        ])
+    }
+
+    fn get_config_value(&self, key: DummyConfig) -> ConfigValue {
+        match key {
+            DummyConfig::Port => ConfigValue::Number(25565),
+            DummyConfig::Seed => ConfigValue::String("".to_string()),
+            DummyConfig::MaxPlayers => ConfigValue::Number(20),
+            DummyConfig::OnlineMode => ConfigValue::Boolean(true),
         }
     }
 
-    fn update_config(&self, _config: &DummyConfig) -> bool {
-        println!("Config updated");
-        true
+    fn set_config_value(&self, key: DummyConfig, value: ConfigValue) {
+        println!("Config updated {:?} {:?}", key, value);
     }
 
     async fn run_command(&self, command: &str) {
@@ -54,10 +62,10 @@ impl NyliumServer<DummyConfig> for DummyServer {
     }
 }
 
-#[derive(NyliumConfig)]
-pub struct DummyConfig {
-    pub server_address: SocketAddr,
-    pub seed: String,
-    pub max_players: u32,
-    pub online_mode: bool,
+#[derive(Debug, Clone, Copy)]
+pub enum DummyConfig {
+    Port,
+    Seed,
+    MaxPlayers,
+    OnlineMode,
 }

@@ -7,6 +7,3 @@ edition.workspace = true
 async-trait.workspace = true
 gpui.workspace = true
 uuid.workspace = true
-
-nylium-config-derive = { path = "../nylium-config-derive" }
-nylium-shared = { path = "../nylium-shared" }

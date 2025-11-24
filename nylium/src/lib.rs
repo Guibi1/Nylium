@@ -4,22 +4,20 @@ use std::sync::Arc;
 use gpui::*;
 use gpui_component::{Root, TitleBar};
 use nylium_adapter::NyliumServer;
-use nylium_adapter::config::NyliumConfig;
 use nylium_assets::NyliumAssetSource;
 
 mod http_client;
 mod logger;
-mod pages;
-mod window;
+mod ui;
 
 use crate::http_client::HttpClient;
-use crate::window::NyliumWindow;
+use crate::ui::NyliumWindow;
 
 pub use crate::logger::NyliumLogger;
 
 pub struct Nylium<S, C>
 where
-    C: NyliumConfig,
+    C: Copy,
     S: NyliumServer<C>,
 {
     server: S,
@@ -29,7 +27,7 @@ where
 
 impl<S, C> Nylium<S, C>
 where
-    C: NyliumConfig,
+    C: Copy + 'static,
     S: NyliumServer<C>,
 {
     pub fn new(server: S, logger: NyliumLogger) -> Self {
@@ -46,16 +44,7 @@ where
             .with_http_client(Arc::new(HttpClient::new()))
             .run(move |cx| {
                 gpui_component::init(cx);
-
-                cx.set_global(self.server.get_config());
                 cx.set_global(self.server);
-
-                // Update config when changed
-                cx.observe_global::<C>(|cx| {
-                    let server = cx.global::<S>();
-                    server.update_config(cx.global::<C>());
-                })
-                .detach();
 
                 // Stop server when closing Nylium
                 cx.on_app_quit(|cx| {

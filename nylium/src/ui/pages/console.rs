@@ -5,15 +5,14 @@ use gpui_component::Sizable;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::input::{Input, InputEvent, InputState};
 use nylium_adapter::NyliumServer;
-use nylium_adapter::config::NyliumConfig;
 use nylium_assets::Assets;
 
 use crate::logger::NyliumLogger;
 
 pub struct ConsolePage<S, C>
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy,
+    S: NyliumServer<C>,
 {
     logs_state: Entity<InputState>,
     command_state: Entity<InputState>,
@@ -23,8 +22,8 @@ where
 
 impl<S, C> ConsolePage<S, C>
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy + 'static,
+    S: NyliumServer<C>,
 {
     pub fn new(logger: NyliumLogger, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let command_state = cx.new(|cx| {
@@ -91,8 +90,8 @@ where
 
 impl<S, C> Render for ConsolePage<S, C>
 where
-    C: NyliumConfig,
-    S: NyliumServer<C> + 'static,
+    C: Copy + 'static,
+    S: NyliumServer<C>,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()

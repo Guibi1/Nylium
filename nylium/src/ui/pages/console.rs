@@ -9,21 +9,24 @@ use nylium_assets::Assets;
 
 use crate::logger::NyliumLogger;
 
-pub struct ConsolePage<S, C>
+pub struct ConsolePage<S, C, G>
 where
     C: Copy,
-    S: NyliumServer<C>,
+    G: Copy,
+    S: NyliumServer<C, G>,
 {
     logs_state: Entity<InputState>,
     command_state: Entity<InputState>,
     _phantoms: PhantomData<S>,
     _phantomc: PhantomData<C>,
+    _phantomg: PhantomData<G>,
 }
 
-impl<S, C> ConsolePage<S, C>
+impl<S, C, G> ConsolePage<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C>,
+    G: Copy + 'static,
+    S: NyliumServer<C, G>,
 {
     pub fn new(logger: NyliumLogger, window: &mut Window, cx: &mut Context<Self>) -> Self {
         let command_state = cx.new(|cx| {
@@ -62,7 +65,7 @@ where
 
         let window_handle = window.window_handle();
         cx.spawn(
-            move |this: WeakEntity<ConsolePage<S, C>>, cx: &mut AsyncApp| {
+            move |this: WeakEntity<ConsolePage<S, C, G>>, cx: &mut AsyncApp| {
                 let mut cx = cx.clone();
                 async move {
                     while logger.wait_for_log().await {
@@ -84,14 +87,16 @@ where
             logs_state,
             _phantoms: PhantomData,
             _phantomc: PhantomData,
+            _phantomg: PhantomData,
         }
     }
 }
 
-impl<S, C> Render for ConsolePage<S, C>
+impl<S, C, G> Render for ConsolePage<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C>,
+    G: Copy + 'static,
+    S: NyliumServer<C, G>,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()

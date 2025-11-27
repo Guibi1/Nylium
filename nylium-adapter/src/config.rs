@@ -1,32 +1,35 @@
 use gpui::SharedString;
 
-pub enum ConfigOptions<C> {
-    Boolean(BooleanConfigOption<C>),
-    Number(NumberConfigOption<C>),
-    String(StringConfigOption<C>),
+pub enum FieldOptions<K> {
+    Boolean(BooleanFieldOptions<K>),
+    Number(NumberFieldOptions<K>),
+    String(StringFieldOptions<K>),
 }
 
-pub struct BooleanConfigOption<C> {
+pub struct BooleanFieldOptions<K> {
+    pub key: K,
     pub label: SharedString,
-    pub key: C,
     pub id: SharedString,
 }
 
-pub struct NumberConfigOption<C> {
+pub struct NumberFieldOptions<K> {
+    pub key: K,
     pub label: SharedString,
-    pub key: C,
     pub min: Option<u32>,
     pub max: Option<u32>,
 }
 
-pub struct StringConfigOption<C> {
+pub struct StringFieldOptions<K> {
+    pub key: K,
     pub label: SharedString,
-    pub key: C,
 }
 
-impl<C> ConfigOptions<C> {
-    pub fn new_bool(key: C, label: impl Into<SharedString>, id: impl Into<SharedString>) -> Self {
-        ConfigOptions::Boolean(BooleanConfigOption {
+impl<K> FieldOptions<K>
+where
+    K: Copy,
+{
+    pub fn new_bool(key: K, label: impl Into<SharedString>, id: impl Into<SharedString>) -> Self {
+        FieldOptions::Boolean(BooleanFieldOptions {
             label: label.into(),
             key,
             id: id.into(),
@@ -34,12 +37,12 @@ impl<C> ConfigOptions<C> {
     }
 
     pub fn new_number(
-        key: C,
+        key: K,
         label: impl Into<SharedString>,
         min: Option<u32>,
         max: Option<u32>,
     ) -> Self {
-        ConfigOptions::Number(NumberConfigOption {
+        FieldOptions::Number(NumberFieldOptions {
             label: label.into(),
             key,
             min,
@@ -47,39 +50,47 @@ impl<C> ConfigOptions<C> {
         })
     }
 
-    pub fn new_string(key: C, label: impl Into<SharedString>) -> Self {
-        ConfigOptions::String(StringConfigOption {
+    pub fn new_string(key: K, label: impl Into<SharedString>) -> Self {
+        FieldOptions::String(StringFieldOptions {
             label: label.into(),
             key,
         })
     }
+
+    pub fn key(&self) -> K {
+        match self {
+            FieldOptions::Boolean(option) => option.key,
+            FieldOptions::Number(option) => option.key,
+            FieldOptions::String(option) => option.key,
+        }
+    }
 }
 
-#[derive(Debug)]
-pub enum ConfigValue {
+#[derive(Debug, Clone)]
+pub enum FieldValue {
     Boolean(bool),
     Number(u32),
     String(String),
 }
 
-impl ConfigValue {
+impl FieldValue {
     pub fn assert_bool(self) -> bool {
         match self {
-            ConfigValue::Boolean(value) => value,
+            FieldValue::Boolean(value) => value,
             _ => panic!("Config value is a boolean."),
         }
     }
 
     pub fn assert_number(self) -> u32 {
         match self {
-            ConfigValue::Number(value) => value,
+            FieldValue::Number(value) => value,
             _ => panic!("Config value is a number."),
         }
     }
 
     pub fn assert_string(self) -> String {
         match self {
-            ConfigValue::String(value) => value,
+            FieldValue::String(value) => value,
             _ => panic!("Config value is a string."),
         }
     }

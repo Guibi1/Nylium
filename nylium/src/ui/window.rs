@@ -6,38 +6,43 @@ use nylium_adapter::NyliumServer;
 use nylium_assets::Assets;
 
 use crate::logger::NyliumLogger;
-use crate::ui::pages::{ConsolePage, PlayersPage, SettingsPage};
+use crate::ui::pages::{ConsolePage, GameRulesPage, PlayersPage, SettingsPage};
 
-pub struct NyliumWindow<S, C>
+pub struct NyliumWindow<S, C, G>
 where
     C: Copy,
-    S: NyliumServer<C> + 'static,
+    G: Copy,
+    S: NyliumServer<C, G> + 'static,
 {
     active_tab: usize,
-    console_page: Entity<ConsolePage<S, C>>,
-    players_page: Entity<PlayersPage<S, C>>,
-    settings_page: Entity<SettingsPage<S, C>>,
+    console_page: Entity<ConsolePage<S, C, G>>,
+    players_page: Entity<PlayersPage<S, C, G>>,
+    game_rules_page: Entity<GameRulesPage>,
+    settings_page: Entity<SettingsPage>,
 }
 
-impl<S, C> NyliumWindow<S, C>
+impl<S, C, G> NyliumWindow<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C> + 'static,
+    G: Copy + 'static,
+    S: NyliumServer<C, G> + 'static,
 {
     pub fn new(logger: NyliumLogger, window: &mut Window, cx: &mut Context<Self>) -> Self {
         Self {
             active_tab: 0,
             console_page: cx.new(|cx| ConsolePage::new(logger, window, cx)),
             players_page: cx.new(|cx| PlayersPage::new(window, cx)),
-            settings_page: cx.new(|cx| SettingsPage::new(window, cx)),
+            game_rules_page: cx.new(|cx| GameRulesPage::new::<S, C, G>(window, cx)),
+            settings_page: cx.new(|cx| SettingsPage::new::<S, C, G>(window, cx)),
         }
     }
 }
 
-impl<S, C> Render for NyliumWindow<S, C>
+impl<S, C, G> Render for NyliumWindow<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C> + 'static,
+    G: Copy + 'static,
+    S: NyliumServer<C, G> + 'static,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
@@ -66,7 +71,13 @@ where
                     }))
                     .child(Tab::new().label("Console").prefix(Assets::Terminal).px_2())
                     .child(Tab::new().label("Players").prefix(Assets::Users).px_2())
-                    .child(Tab::new().label("Settings").prefix(Assets::Settings).px_2()),
+                    .child(
+                        Tab::new()
+                            .label("Game rules")
+                            .prefix(Assets::Settings)
+                            .px_2(),
+                    )
+                    .child(Tab::new().label("Settings").prefix(Assets::Gear).px_2()),
             )
             .when(self.active_tab == 0, |this| {
                 this.child(self.console_page.clone())
@@ -75,6 +86,9 @@ where
                 this.child(self.players_page.clone())
             })
             .when(self.active_tab == 2, |this| {
+                this.child(self.game_rules_page.clone())
+            })
+            .when(self.active_tab == 3, |this| {
                 this.child(self.settings_page.clone())
             })
     }

@@ -13,20 +13,23 @@ use nylium_assets::Assets;
 
 actions!(player, [CopyUuid, Op, Kick, Ban]);
 
-pub struct PlayersPage<S, C>
+pub struct PlayersPage<S, C, G>
 where
     C: Copy,
-    S: NyliumServer<C>,
+    G: Copy,
+    S: NyliumServer<C, G>,
 {
     players: Option<Vec<Player>>,
     _phantoms: PhantomData<S>,
     _phantomc: PhantomData<C>,
+    _phantomg: PhantomData<G>,
 }
 
-impl<S, C> PlayersPage<S, C>
+impl<S, C, G> PlayersPage<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C>,
+    G: Copy + 'static,
+    S: NyliumServer<C, G>,
 {
     pub fn new(_window: &mut Window, cx: &mut Context<Self>) -> Self {
         load_players(cx);
@@ -35,22 +38,23 @@ where
             players: None,
             _phantoms: PhantomData,
             _phantomc: PhantomData,
+            _phantomg: PhantomData,
         }
     }
 }
 
-impl<S, C> Render for PlayersPage<S, C>
+impl<S, C, G> Render for PlayersPage<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C>,
+    G: Copy + 'static,
+    S: NyliumServer<C, G>,
 {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
+            .p_4()
             .flex()
             .flex_col()
-            .px_4()
-            .py_4()
             .gap_2()
             .scrollable(Axis::Vertical)
             .child(
@@ -77,10 +81,10 @@ where
                     div()
                         .w_full()
                         .flex_grow()
-                        .flex()
-                        .gap_2()
                         .py_0p5()
                         .px_4()
+                        .flex()
+                        .gap_2()
                         .items_center()
                         .hover(|this| this.bg(cx.theme().muted))
                         .on_action::<CopyUuid>({
@@ -148,13 +152,14 @@ where
     }
 }
 
-fn load_players<S, C>(cx: &mut Context<PlayersPage<S, C>>)
+fn load_players<S, C, G>(cx: &mut Context<PlayersPage<S, C, G>>)
 where
     C: Copy + 'static,
-    S: NyliumServer<C>,
+    G: Copy + 'static,
+    S: NyliumServer<C, G>,
 {
     cx.spawn(async move |this, cx| {
-        let server = cx.read_global::<S, S>(|s, _| s.clone()).unwrap();
+        let server = cx.read_global::<S, _>(|s, _| s.clone()).unwrap();
         let players = cx
             .background_spawn(async move { server.get_players().await })
             .await;

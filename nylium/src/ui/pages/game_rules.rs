@@ -1,16 +1,16 @@
 use gpui::*;
+use gpui_component::StyledExt;
 use gpui_component::label::Label;
-use gpui_component::{ActiveTheme, StyledExt};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::FieldOptions;
 
 use crate::ui::form::{BooleanField, NumberField, StringField};
 
-pub struct SettingsPage {
+pub struct GameRulesPage {
     fields: Box<[AnyView]>,
 }
 
-impl SettingsPage {
+impl GameRulesPage {
     pub fn new<S, C, G>(window: &mut Window, cx: &mut Context<Self>) -> Self
     where
         C: Copy + 'static,
@@ -20,19 +20,18 @@ impl SettingsPage {
         Self {
             fields: cx
                 .global::<S>()
-                .get_config()
+                .get_gamerules()
                 .into_iter()
                 .map(|option| {
-                    let value = cx.global::<S>().get_config_value(option.key());
+                    let value = cx.global::<S>().get_gamerule_value(option.key());
                     match option {
                         FieldOptions::Boolean(option) => {
                             let field = cx.new(|_| {
                                 BooleanField::new(option.label, value.assert_bool(), option.id)
                             });
-
                             cx.subscribe(&field, move |_, _, event, cx| {
                                 cx.global_mut::<S>()
-                                    .set_config_value(option.key, event.value.clone())
+                                    .set_gamerule_value(option.key, event.value.clone())
                             })
                             .detach();
                             field.into()
@@ -50,7 +49,7 @@ impl SettingsPage {
                             });
                             cx.subscribe(&field, move |_, _, event, cx| {
                                 cx.global_mut::<S>()
-                                    .set_config_value(option.key, event.value.clone())
+                                    .set_gamerule_value(option.key, event.value.clone())
                             })
                             .detach();
                             field.into()
@@ -59,10 +58,9 @@ impl SettingsPage {
                             let field = cx.new(|cx| {
                                 StringField::new(option.label, value.assert_string(), window, cx)
                             });
-
                             cx.subscribe(&field, move |_, _, event, cx| {
                                 cx.global_mut::<S>()
-                                    .set_config_value(option.key, event.value.clone())
+                                    .set_gamerule_value(option.key, event.value.clone())
                             })
                             .detach();
                             field.into()
@@ -74,18 +72,13 @@ impl SettingsPage {
     }
 }
 
-impl Render for SettingsPage {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+impl Render for GameRulesPage {
+    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div().flex().flex_col().gap_2().overflow_hidden().child(
             div()
                 .p_4()
                 .scrollable(Axis::Vertical)
-                .child(Label::new("Server settings").text_xl())
-                .child(
-                    Label::new("A restart is required for changes to take effect.")
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground),
-                )
+                .child(Label::new("Game rules").text_xl())
                 .child(
                     div()
                         .p_4()

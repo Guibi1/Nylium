@@ -15,26 +15,30 @@ use crate::ui::NyliumWindow;
 
 pub use crate::logger::NyliumLogger;
 
-pub struct Nylium<S, C>
+pub struct Nylium<S, C, G>
 where
     C: Copy,
-    S: NyliumServer<C>,
+    G: Copy,
+    S: NyliumServer<C, G>,
 {
     server: S,
     logger: NyliumLogger,
-    _phantom: PhantomData<C>,
+    _phantomc: PhantomData<C>,
+    _phantomg: PhantomData<G>,
 }
 
-impl<S, C> Nylium<S, C>
+impl<S, C, G> Nylium<S, C, G>
 where
     C: Copy + 'static,
-    S: NyliumServer<C>,
+    G: Copy + 'static,
+    S: NyliumServer<C, G>,
 {
     pub fn new(server: S, logger: NyliumLogger) -> Self {
         Self {
             server,
             logger,
-            _phantom: PhantomData,
+            _phantomc: PhantomData,
+            _phantomg: PhantomData,
         }
     }
 
@@ -60,7 +64,7 @@ where
                     ..Default::default()
                 };
                 cx.open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| NyliumWindow::<S, C>::new(self.logger, window, cx));
+                    let view = cx.new(|cx| NyliumWindow::<S, C, G>::new(self.logger, window, cx));
                     cx.new(|cx| Root::new(AnyView::from(view), window, cx))
                 })
                 .unwrap();

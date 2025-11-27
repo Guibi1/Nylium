@@ -69,7 +69,7 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
             FieldOptions::new_number(
                 GameRuleKeys::CommandModificationBlockLimit,
                 "Command Modification Block Limit",
-                Some(0),
+                None,
                 Some(32768),
             ),
             FieldOptions::new_bool(
@@ -173,19 +173,19 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
             FieldOptions::new_number(
                 GameRuleKeys::MaxCommandChainLength,
                 "Max Command Chain Length",
-                Some(0),
+                None,
                 Some(16777215),
             ),
             FieldOptions::new_number(
                 GameRuleKeys::MaxCommandForkCount,
                 "Max Command Fork Count",
-                Some(0),
+                None,
                 Some(16777215),
             ),
             FieldOptions::new_number(
                 GameRuleKeys::MaxEntityCramming,
                 "Max Entity Cramming",
-                Some(0),
+                None,
                 Some(255),
             ),
             FieldOptions::new_bool(
@@ -202,19 +202,19 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
             FieldOptions::new_number(
                 GameRuleKeys::PlayersNetherPortalCreativeDelay,
                 "Players Nether Portal Creative Delay",
-                Some(0),
+                None,
                 Some(16777215),
             ),
             FieldOptions::new_number(
                 GameRuleKeys::PlayersNetherPortalDefaultDelay,
                 "Players Nether Portal Default Delay",
-                Some(0),
+                None,
                 Some(16777215),
             ),
             FieldOptions::new_number(
                 GameRuleKeys::PlayersSleepingPercentage,
                 "Players Sleeping Percentage",
-                Some(0),
+                None,
                 Some(100),
             ),
             FieldOptions::new_bool(
@@ -225,7 +225,7 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
             FieldOptions::new_number(
                 GameRuleKeys::RandomTickSpeed,
                 "Random Tick Speed",
-                Some(0),
+                None,
                 Some(4096),
             ),
             FieldOptions::new_bool(
@@ -252,15 +252,10 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
             FieldOptions::new_number(
                 GameRuleKeys::SpawnChunkRadius,
                 "Spawn Chunk Radius",
-                Some(0),
+                None,
                 Some(32),
             ),
-            FieldOptions::new_number(
-                GameRuleKeys::SpawnRadius,
-                "Spawn Radius",
-                Some(0),
-                Some(65536),
-            ),
+            FieldOptions::new_number(GameRuleKeys::SpawnRadius, "Spawn Radius", None, Some(65536)),
             FieldOptions::new_bool(
                 GameRuleKeys::SpectatorsGenerateChunks,
                 "Spectators Generate Chunks",

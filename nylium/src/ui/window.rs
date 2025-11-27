@@ -17,8 +17,8 @@ where
     active_tab: usize,
     console_page: Entity<ConsolePage<S, C, G>>,
     players_page: Entity<PlayersPage<S, C, G>>,
-    game_rules_page: Entity<GameRulesPage>,
-    settings_page: Entity<SettingsPage>,
+    game_rules_page: Entity<GameRulesPage<S, C, G>>,
+    settings_page: Entity<SettingsPage<S, C, G>>,
 }
 
 impl<S, C, G> NyliumWindow<S, C, G>
@@ -32,8 +32,8 @@ where
             active_tab: 0,
             console_page: cx.new(|cx| ConsolePage::new(logger, window, cx)),
             players_page: cx.new(|cx| PlayersPage::new(window, cx)),
-            game_rules_page: cx.new(|cx| GameRulesPage::new::<S, C, G>(window, cx)),
-            settings_page: cx.new(|cx| SettingsPage::new::<S, C, G>(window, cx)),
+            game_rules_page: cx.new(|cx| GameRulesPage::new(window, cx)),
+            settings_page: cx.new(|cx| SettingsPage::new(window, cx)),
         }
     }
 }

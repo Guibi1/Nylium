@@ -28,6 +28,10 @@ impl StringField {
 
         Self { label, state }
     }
+
+    pub fn get_height() -> Size<Pixels> {
+        Size::new(px(0.), px(72.))
+    }
 }
 
 impl EventEmitter<ChangeEvent> for StringField {}
@@ -35,6 +39,7 @@ impl EventEmitter<ChangeEvent> for StringField {}
 impl Render for StringField {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap_1()

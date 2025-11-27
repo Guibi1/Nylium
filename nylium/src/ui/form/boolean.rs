@@ -17,6 +17,10 @@ impl BooleanField {
             value: initial,
         }
     }
+
+    pub fn get_height() -> Size<Pixels> {
+        Size::new(px(0.), px(60.))
+    }
 }
 
 impl EventEmitter<ChangeEvent> for BooleanField {}
@@ -24,6 +28,7 @@ impl EventEmitter<ChangeEvent> for BooleanField {}
 impl Render for BooleanField {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .w_full()
             .flex()
             .flex_col()
             .gap_1()

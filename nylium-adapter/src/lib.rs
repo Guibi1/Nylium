@@ -4,7 +4,7 @@ use gpui::{App, AppContext, SharedString};
 pub mod config;
 mod player;
 
-pub use crate::player::Player;
+pub use crate::player::*;
 pub use gpui::Global;
 
 use crate::config::{FieldOptions, FieldValue};

@@ -4,8 +4,7 @@ use std::rc::Rc;
 use gpui::*;
 use gpui_component::button::{Button, ButtonVariants};
 use gpui_component::label::Label;
-use gpui_component::scroll::Scrollbar;
-use gpui_component::scroll::ScrollbarState;
+use gpui_component::scroll::{Scrollbar, ScrollbarState};
 use gpui_component::{VirtualListScrollHandle, v_virtual_list};
 use nylium_adapter::NyliumServer;
 use nylium_adapter::config::FieldOptions;
@@ -20,7 +19,7 @@ where
     S: NyliumServer<C, G>,
 {
     fields: Box<[AnyView]>,
-    field_sizes: Rc<Vec<Size<Pixels>>>,
+    element_heights: Rc<Vec<Size<Pixels>>>,
     scroll_handle: VirtualListScrollHandle,
     scroll_state: ScrollbarState,
     _phantoms: PhantomData<S>,
@@ -35,11 +34,11 @@ where
     S: NyliumServer<C, G>,
 {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
-        let (fields, field_sizes) = generate_fields(window, cx);
+        let (fields, element_heights) = generate_fields(window, cx);
 
         Self {
             fields,
-            field_sizes: Rc::new(field_sizes),
+            element_heights: Rc::new(element_heights),
             scroll_handle: VirtualListScrollHandle::new(),
             scroll_state: ScrollbarState::default(),
             _phantoms: PhantomData,
@@ -75,7 +74,7 @@ where
                         cx.listener(|this, _, window, cx| {
                             let (fields, field_sizes) = generate_fields(window, cx);
                             this.fields = fields;
-                            this.field_sizes = Rc::new(field_sizes);
+                            this.element_heights = Rc::new(field_sizes);
                             cx.notify();
                         }),
                     )),
@@ -84,7 +83,7 @@ where
                 v_virtual_list(
                     cx.entity().clone(),
                     "game_rules_list",
-                    self.field_sizes.clone(),
+                    self.element_heights.clone(),
                     |this, range, _, _| {
                         range
                             .filter_map::<AnyElement, _>(|i| {
@@ -116,7 +115,7 @@ where
     G: Copy + 'static,
     S: NyliumServer<C, G>,
 {
-    let mut field_sizes = Vec::new();
+    let mut element_heights = Vec::new();
     let fields: Box<[AnyView]> = cx
         .global::<S>()
         .get_gamerules()
@@ -125,7 +124,7 @@ where
             let value = cx.global::<S>().get_gamerule_value(option.key());
             match option {
                 FieldOptions::Boolean(option) => {
-                    field_sizes.push(BooleanField::get_height());
+                    element_heights.push(BooleanField::get_height());
                     let field =
                         cx.new(|_| BooleanField::new(option.label, value.assert_bool(), option.id));
                     cx.subscribe(&field, move |_, _, event, cx| {
@@ -136,7 +135,7 @@ where
                     field.into()
                 }
                 FieldOptions::Number(option) => {
-                    field_sizes.push(NumberField::get_height());
+                    element_heights.push(NumberField::get_height());
                     let field = cx.new(|cx| {
                         NumberField::new(
                             option.label,
@@ -155,7 +154,7 @@ where
                     field.into()
                 }
                 FieldOptions::String(option) => {
-                    field_sizes.push(StringField::get_height());
+                    element_heights.push(StringField::get_height());
                     let field = cx.new(|cx| {
                         StringField::new(option.label, value.assert_string(), window, cx)
                     });
@@ -170,6 +169,6 @@ where
         })
         .collect();
 
-    field_sizes.push(Size::new(px(0.), px(8.)));
-    (fields, field_sizes)
+    element_heights.push(Size::new(px(0.), px(8.)));
+    (fields, element_heights)
 }

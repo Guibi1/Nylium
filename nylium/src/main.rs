@@ -4,7 +4,7 @@ use async_trait::async_trait;
 use gpui::Global;
 use nylium::{Nylium, NyliumLogger};
 use nylium_adapter::config::{FieldOptions, FieldValue};
-use nylium_adapter::{NyliumServer, Player};
+use nylium_adapter::{NyliumServer, Player, PlayerMap};
 use uuid::Uuid;
 
 fn main() {
@@ -344,11 +344,26 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
     }
 
     async fn get_players(&self) -> Vec<Player> {
-        vec![Player::new(
-            Uuid::from_str("0939003b-c550-4914-a461-09b5bb0c80ea").unwrap(),
-            "Guibi1",
-            true,
-        )]
+        vec![
+            Player::new(
+                Uuid::from_str("0939003b-c550-4914-a461-09b5bb0c80ea").unwrap(),
+                "Guibi1",
+                PlayerMap::Overworld,
+                true,
+            ),
+            Player::new(
+                Uuid::from_str("829fcbb6-8375-4f38-adcf-6959e1835743").unwrap(),
+                "LMF0906",
+                PlayerMap::Nether,
+                false,
+            ),
+            Player::new(
+                Uuid::from_str("b876ec32-e396-476b-a115-8438d83c67d4").unwrap(),
+                "Technoblade",
+                PlayerMap::Custom("Skyblock".into()),
+                true,
+            ),
+        ]
     }
 }
 

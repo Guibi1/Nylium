@@ -29,8 +29,8 @@ impl NumberField {
             InputEvent::Change => {
                 let text = state.read(cx).value();
                 if let Ok(new_value) = text.parse() {
-                    if this.min.map(|min| new_value >= min).unwrap_or(true)
-                        && this.max.map(|max| new_value <= max).unwrap_or(true)
+                    if this.min.is_none_or(|min| new_value >= min)
+                        && this.max.is_none_or(|max| new_value <= max)
                     {
                         cx.emit(ChangeEvent::new_number(new_value));
                     }
@@ -45,8 +45,8 @@ impl NumberField {
                 NumberInputEvent::Step(step_action) => {
                     let text = state.read(cx).value();
                     if let Ok(value) = text.parse::<u32>() {
-                        if this.min.map(|min| value > min).unwrap_or(true)
-                            && this.max.map(|max| value < max).unwrap_or(true)
+                        if this.min.is_none_or(|min| value > min)
+                            && this.max.is_none_or(|max| value < max)
                         {
                             let new_value = match step_action {
                                 StepAction::Increment => value.saturating_add(1),

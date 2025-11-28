@@ -6,14 +6,24 @@ pub struct Player {
     pub id: Uuid,
     pub name: SharedString,
     pub online: bool,
+    pub map: PlayerMap,
 }
 
 impl Player {
-    pub fn new(id: Uuid, name: impl Into<SharedString>, online: bool) -> Self {
+    pub fn new(id: Uuid, name: impl Into<SharedString>, map: PlayerMap, online: bool) -> Self {
         Self {
             id,
             name: name.into(),
             online,
+            map,
         }
     }
+}
+
+#[derive(Clone, PartialEq)]
+pub enum PlayerMap {
+    Overworld,
+    Nether,
+    End,
+    Custom(SharedString),
 }

@@ -203,7 +203,7 @@ where
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
 
-        let _ = this.update(cx, |this, _cx| {
+        let _ = this.update(cx, |this, cx| {
             if this
                 .players
                 .as_ref()
@@ -214,6 +214,7 @@ where
                 this.element_heights = Rc::new(element_heights);
             }
             this.players = Some(Rc::new(players));
+            cx.notify();
         });
     })
     .detach();

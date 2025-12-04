@@ -121,12 +121,12 @@ where
                                 .filter_map(|i| players.get(i))
                                 .map(|player| {
                                     div()
+                                        .h(px(38.))
                                         .w_full()
                                         .flex_grow()
-                                        .py_0p5()
                                         .px_4()
                                         .flex()
-                                        .gap_2()
+                                        .gap_3()
                                         .items_center()
                                         .hover(|this| this.bg(cx.theme().muted))
                                         .child(
@@ -178,8 +178,7 @@ where
                                 .collect()
                         },
                     )
-                    .track_scroll(&self.scroll_handle)
-                    .px_4(),
+                    .track_scroll(&self.scroll_handle),
                 )
                 .child(
                     div()
@@ -199,9 +198,14 @@ where
 {
     cx.spawn(async move |this, cx| {
         let server = cx.read_global::<S, _>(|s, _| s.clone()).unwrap();
-        let players = cx
+        let mut players = cx
             .background_spawn(async move { server.get_players().await })
             .await;
+        players.sort_unstable_by(|a, b| {
+            b.online
+                .cmp(&a.online)
+                .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+        });
 
         let _ = this.update(cx, |this, _cx| {
             if this
@@ -209,7 +213,7 @@ where
                 .as_ref()
                 .is_none_or(|p| p.len() != players.len())
             {
-                let mut element_heights = vec![Size::new(px(0.), px(38.)); players.len()];
+                let mut element_heights = vec![Size::new(px(0.), px(48.)); players.len()];
                 element_heights.push(Size::new(px(0.), px(8.)));
                 this.element_heights = Rc::new(element_heights);
             }

@@ -27,3 +27,14 @@ pub enum PlayerMap {
     End,
     Custom(SharedString),
 }
+
+impl PlayerMap {
+    pub fn get_name(&self) -> SharedString {
+        match self {
+            PlayerMap::Overworld => "Overworld".into(),
+            PlayerMap::Nether => "Nether".into(),
+            PlayerMap::End => "End".into(),
+            PlayerMap::Custom(name) => name.clone(),
+        }
+    }
+}

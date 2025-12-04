@@ -13,7 +13,7 @@ use gpui_component::{ActiveTheme, Sizable, VirtualListScrollHandle, v_virtual_li
 use nylium_adapter::{NyliumServer, Player};
 use nylium_assets::Assets;
 
-actions!(player, [CopyUuid, Op, Kick, Ban]);
+use crate::actions::{Ban, CopyUuid, Kick, Op};
 
 pub struct PlayersPage<S, C, G>
 where
@@ -49,6 +49,25 @@ where
             _phantomg: PhantomData,
         }
     }
+
+    fn on_copy_uuid(event: &CopyUuid, _window: &mut Window, cx: &mut App) {
+        cx.write_to_clipboard(ClipboardItem::new_string(event.uuid.to_string()));
+    }
+
+    fn on_op_player(event: &Op, _window: &mut Window, cx: &mut App) {
+        cx.global::<S>()
+            .send_command(cx, format!("op {}", event.name));
+    }
+
+    fn on_kick_player(event: &Kick, _window: &mut Window, cx: &mut App) {
+        cx.global::<S>()
+            .send_command(cx, format!("kick {}", event.name));
+    }
+
+    fn on_ban_player(event: &Ban, _window: &mut Window, cx: &mut App) {
+        cx.global::<S>()
+            .send_command(cx, format!("ban {}", event.name));
+    }
 }
 
 impl<S, C, G> Render for PlayersPage<S, C, G>
@@ -68,6 +87,10 @@ where
             .flex()
             .flex_col()
             .gap_2()
+            .on_action(Self::on_copy_uuid)
+            .on_action(Self::on_op_player)
+            .on_action(Self::on_kick_player)
+            .on_action(Self::on_ban_player)
             .child(
                 div()
                     .flex()
@@ -95,97 +118,62 @@ where
                         element_heights,
                         move |_, range, _, cx| {
                             range
-                                .filter_map(|i| {
-                                    players.get(i).map(|player| {
-                                        div()
-                                            .w_full()
-                                            .flex_grow()
-                                            .py_0p5()
-                                            .px_4()
-                                            .flex()
-                                            .gap_2()
-                                            .items_center()
-                                            .hover(|this| this.bg(cx.theme().muted))
-                                            .on_action::<CopyUuid>({
-                                                let id = player.id;
-                                                move |_, _, cx| {
-                                                    cx.write_to_clipboard(
-                                                        ClipboardItem::new_string(id.to_string()),
-                                                    );
-                                                }
-                                            })
-                                            .on_action::<Op>({
-                                                let name = player.name.clone();
-                                                move |_, _, cx| {
-                                                    cx.global::<S>()
-                                                        .send_command(cx, format!("op {}", name));
-                                                }
-                                            })
-                                            .on_action::<Kick>({
-                                                let name = player.name.clone();
-                                                move |_, _, cx| {
-                                                    cx.global::<S>()
-                                                        .send_command(cx, format!("kick {}", name));
-                                                }
-                                            })
-                                            .on_action::<Ban>({
-                                                let name = player.name.clone();
-                                                move |_, _, cx| {
-                                                    cx.global::<S>()
-                                                        .send_command(cx, format!("ban {}", name));
-                                                }
-                                            })
-                                            .child(
-                                                div()
-                                                    .relative()
-                                                    .size_6()
-                                                    .overflow_hidden()
-                                                    .child(
-                                                        Skeleton::new()
-                                                            .absolute()
-                                                            .inset_0()
-                                                            .size_full(),
-                                                    )
-                                                    .child(
-                                                        img(format!(
-                                                            "https://api.mineatar.io/face/{}",
-                                                            player.id
-                                                        ))
+                                .filter_map(|i| players.get(i))
+                                .map(|player| {
+                                    div()
+                                        .w_full()
+                                        .flex_grow()
+                                        .py_0p5()
+                                        .px_4()
+                                        .flex()
+                                        .gap_2()
+                                        .items_center()
+                                        .hover(|this| this.bg(cx.theme().muted))
+                                        .child(
+                                            div()
+                                                .relative()
+                                                .size_6()
+                                                .overflow_hidden()
+                                                .child(
+                                                    Skeleton::new()
                                                         .absolute()
                                                         .inset_0()
                                                         .size_full(),
-                                                    ),
-                                            )
-                                            .child(
-                                                div()
-                                                    .flex_grow()
-                                                    .flex()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap_1()
-                                                    .child(Label::new(&player.name))
-                                                    .when(!player.online, |this| {
-                                                        this.child(
-                                                            Label::new("Offline")
-                                                                .text_xs()
-                                                                .text_color(
-                                                                    cx.theme().muted_foreground,
-                                                                ),
-                                                        )
-                                                    }),
-                                            )
-                                            .child(
-                                                Button::new(player.id)
-                                                    .icon(Assets::Ellipsis)
-                                                    .with_variant(ButtonVariant::Link)
-                                                    .dropdown_menu({
-                                                        let online = player.online;
-                                                        move |menu, _, _| {
-                                                            create_player_menu(menu, online)
-                                                        }
-                                                    }),
-                                            )
-                                    })
+                                                )
+                                                .child(
+                                                    img(format!(
+                                                        "https://api.mineatar.io/face/{}",
+                                                        player.id
+                                                    ))
+                                                    .absolute()
+                                                    .inset_0()
+                                                    .size_full(),
+                                                ),
+                                        )
+                                        .child(
+                                            div()
+                                                .flex_grow()
+                                                .flex()
+                                                .flex_col()
+                                                .justify_center()
+                                                .line_height(px(10.))
+                                                .child(Label::new(&player.name))
+                                                .child(
+                                                    Label::new(if player.online {
+                                                        player.map.get_name()
+                                                    } else {
+                                                        "Offline".into()
+                                                    })
+                                                    .text_xs()
+                                                    .text_color(cx.theme().muted_foreground),
+                                                ),
+                                        )
+                                        .child(
+                                            Button::new(player.id)
+                                                .icon(Assets::Ellipsis)
+                                                .with_variant(ButtonVariant::Link)
+                                                .dropdown_menu(create_popup_menu(player.clone())),
+                                        )
                                 })
                                 .collect()
                         },
@@ -231,10 +219,39 @@ where
     .detach();
 }
 
-fn create_player_menu(menu: PopupMenu, online: bool) -> PopupMenu {
-    menu.menu_with_icon("Copy Uuid", Assets::Copy, Box::new(CopyUuid))
-        .menu_with_icon_and_disabled("OP", Assets::Crown, Box::new(Op), !online)
+fn create_popup_menu(
+    player: Player,
+) -> impl Fn(PopupMenu, &mut Window, &mut Context<PopupMenu>) -> PopupMenu {
+    move |menu, _, _| {
+        menu.menu_with_icon(
+            "Copy Uuid",
+            Assets::Copy,
+            Box::new(CopyUuid { uuid: player.id }),
+        )
+        .menu_with_icon_and_disabled(
+            "OP",
+            Assets::Crown,
+            Box::new(Op {
+                name: player.name.clone(),
+            }),
+            !player.online,
+        )
         .separator()
-        .menu_with_icon_and_disabled("Kick", Assets::Logout, Box::new(Kick), !online)
-        .menu_with_icon_and_disabled("Ban", Assets::Ban, Box::new(Ban), !online)
+        .menu_with_icon_and_disabled(
+            "Kick",
+            Assets::Logout,
+            Box::new(Kick {
+                name: player.name.clone(),
+            }),
+            !player.online,
+        )
+        .menu_with_icon_and_disabled(
+            "Ban",
+            Assets::Ban,
+            Box::new(Ban {
+                name: player.name.clone(),
+            }),
+            !player.online,
+        )
+    }
 }

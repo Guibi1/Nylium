@@ -6,6 +6,7 @@ use gpui_component::{Root, TitleBar};
 use nylium_adapter::NyliumServer;
 use nylium_assets::NyliumAssetSource;
 
+mod actions;
 mod http_client;
 mod logger;
 mod ui;

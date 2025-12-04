@@ -25,9 +25,7 @@ where
     element_heights: Rc<Vec<Size<Pixels>>>,
     scroll_handle: VirtualListScrollHandle,
     scroll_state: ScrollbarState,
-    _phantoms: PhantomData<S>,
-    _phantomc: PhantomData<C>,
-    _phantomg: PhantomData<G>,
+    _phantom: PhantomData<(S, C, G)>,
 }
 
 impl<S, C, G> PlayersPage<S, C, G>
@@ -44,9 +42,7 @@ where
             element_heights: Rc::new(Vec::new()),
             scroll_handle: VirtualListScrollHandle::new(),
             scroll_state: ScrollbarState::default(),
-            _phantoms: PhantomData,
-            _phantomc: PhantomData,
-            _phantomg: PhantomData,
+            _phantom: PhantomData,
         }
     }
 

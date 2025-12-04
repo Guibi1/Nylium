@@ -17,9 +17,7 @@ where
 {
     logs_state: Entity<InputState>,
     command_state: Entity<InputState>,
-    _phantoms: PhantomData<S>,
-    _phantomc: PhantomData<C>,
-    _phantomg: PhantomData<G>,
+    _phantom: PhantomData<(S, C, G)>,
 }
 
 impl<S, C, G> ConsolePage<S, C, G>
@@ -85,9 +83,7 @@ where
         Self {
             command_state,
             logs_state,
-            _phantoms: PhantomData,
-            _phantomc: PhantomData,
-            _phantomg: PhantomData,
+            _phantom: PhantomData,
         }
     }
 }

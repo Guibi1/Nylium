@@ -24,8 +24,7 @@ where
 {
     server: S,
     logger: NyliumLogger,
-    _phantomc: PhantomData<C>,
-    _phantomg: PhantomData<G>,
+    _phantom: PhantomData<(C, G)>,
 }
 
 impl<S, C, G> Nylium<S, C, G>
@@ -38,8 +37,7 @@ where
         Self {
             server,
             logger,
-            _phantomc: PhantomData,
-            _phantomg: PhantomData,
+            _phantom: PhantomData,
         }
     }
 

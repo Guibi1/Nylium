@@ -6,7 +6,7 @@ use nylium_adapter::NyliumServer;
 use nylium_assets::Assets;
 
 use crate::logger::NyliumLogger;
-use crate::ui::pages::{ConsolePage, GameRulesPage, PlayersPage, SettingsPage};
+use crate::ui::pages::{ConsolePage, GameRulesPage, PlayersPage, SettingsPage, StatisticsPage};
 
 pub struct NyliumWindow<S, C, G>
 where
@@ -16,6 +16,7 @@ where
 {
     active_tab: usize,
     console_page: Entity<ConsolePage<S, C, G>>,
+    statistics_page: Entity<StatisticsPage<S, C, G>>,
     players_page: Entity<PlayersPage<S, C, G>>,
     game_rules_page: Entity<GameRulesPage<S, C, G>>,
     settings_page: Entity<SettingsPage<S, C, G>>,
@@ -31,6 +32,7 @@ where
         Self {
             active_tab: 0,
             console_page: cx.new(|cx| ConsolePage::new(logger, window, cx)),
+            statistics_page: cx.new(|cx| StatisticsPage::new(window, cx)),
             players_page: cx.new(|cx| PlayersPage::new(window, cx)),
             game_rules_page: cx.new(|cx| GameRulesPage::new(window, cx)),
             settings_page: cx.new(|cx| SettingsPage::new(window, cx)),
@@ -70,6 +72,7 @@ where
                         cx.notify();
                     }))
                     .child(Tab::new().label("Console").prefix(Assets::Terminal).px_2())
+                    .child(Tab::new().label("Statistics").prefix(Assets::Chart).px_2())
                     .child(Tab::new().label("Players").prefix(Assets::Users).px_2())
                     .child(
                         Tab::new()
@@ -83,12 +86,15 @@ where
                 this.child(self.console_page.clone())
             })
             .when(self.active_tab == 1, |this| {
-                this.child(self.players_page.clone())
+                this.child(self.statistics_page.clone())
             })
             .when(self.active_tab == 2, |this| {
-                this.child(self.game_rules_page.clone())
+                this.child(self.players_page.clone())
             })
             .when(self.active_tab == 3, |this| {
+                this.child(self.game_rules_page.clone())
+            })
+            .when(self.active_tab == 4, |this| {
                 this.child(self.settings_page.clone())
             })
     }

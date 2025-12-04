@@ -9,7 +9,11 @@ chrono = "0.4.42"
 env_logger = "0.11.8"
 log = "0.4.28"
 reqwest = { version = "0.12.24", features = ["stream", "rustls-tls"] }
+ringbuffer = { version = "0.16.0", default-features = false }
 smol = "2.0.2"
+sysinfo = { version = "0.37.2", default-features = false, features = [
+    "system",
+] }
 
 async-trait.workspace = true
 gpui.workspace = true

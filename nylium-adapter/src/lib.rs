@@ -1,13 +1,15 @@
 use async_trait::async_trait;
 use gpui::{App, AppContext, SharedString};
 
-pub mod config;
+pub mod fields;
+mod gamerules;
 mod player;
 
+pub use crate::gamerules::*;
 pub use crate::player::*;
 pub use gpui::Global;
 
-use crate::config::{FieldOptions, FieldValue};
+use crate::fields::{FieldOptions, FieldValue};
 
 #[async_trait]
 pub trait NyliumServer<C: Copy, G: Copy>: Clone + Send + Global {

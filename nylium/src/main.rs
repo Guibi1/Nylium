@@ -3,8 +3,8 @@ use std::str::FromStr;
 use async_trait::async_trait;
 use gpui::Global;
 use nylium::{Nylium, NyliumLogger};
-use nylium_adapter::config::{FieldOptions, FieldValue};
-use nylium_adapter::{NyliumServer, Player, PlayerMap};
+use nylium_adapter::fields::{FieldOptions, FieldValue};
+use nylium_adapter::{GameRuleKeys, NyliumServer, Player, PlayerMap};
 use uuid::Uuid;
 
 fn main() {
@@ -45,238 +45,10 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
         }
     }
 
-    fn set_config_value(&self, key: ConfigKeys, value: FieldValue) {
-        println!("Config updated {:?} {:?}", key, value);
-    }
+    fn set_config_value(&self, _key: ConfigKeys, _value: FieldValue) {}
 
     fn get_gamerules(&self) -> Box<[FieldOptions<GameRuleKeys>]> {
-        Box::new([
-            FieldOptions::new_bool(
-                GameRuleKeys::AnnounceAdvancements,
-                "Announce Advancements",
-                "announceAdvancements",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::BlockExplosionDropDecay,
-                "Block Explosion Drop Decay",
-                "blockExplosionDropDecay",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::CommandBlockOutput,
-                "Command Block Output",
-                "commandBlockOutput",
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::CommandModificationBlockLimit,
-                "Command Modification Block Limit",
-                None,
-                Some(32768),
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DisableElytraMovementCheck,
-                "Disable Elytra Movement Check",
-                "disableElytraMovementCheck",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::DisableRaids, "Disable Raids", "disableRaids"),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoDaylightCycle,
-                "Do Daylight Cycle",
-                "doDaylightCycle",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoEntityDrops,
-                "Do Entity Drops",
-                "doEntityDrops",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::DoFireTick, "Do Fire Tick", "doFireTick"),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoImmediateRespawn,
-                "Do Immediate Respawn",
-                "doImmediateRespawn",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::DoInsomnia, "Do Insomnia", "doInsomnia"),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoLimitedCrafting,
-                "Do Limited Crafting",
-                "doLimitedCrafting",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::DoMobLoot, "Do Mob Loot", "doMobLoot"),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoMobSpawning,
-                "Do Mob Spawning",
-                "doMobSpawning",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoPatrolSpawning,
-                "Do Patrol Spawning",
-                "doPatrolSpawning",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::DoTileDrops, "Do Tile Drops", "doTileDrops"),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoTraderSpawning,
-                "Do Trader Spawning",
-                "doTraderSpawning",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoVinesSpread,
-                "Do Vines Spread",
-                "doVinesSpread",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoWardenSpawning,
-                "Do Warden Spawning",
-                "doWardenSpawning",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DoWeatherCycle,
-                "Do Weather Cycle",
-                "doWeatherCycle",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::DrowningDamage,
-                "Drowning Damage",
-                "drowningDamage",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::EnderPearlsVanishOnDeath,
-                "Ender Pearls Vanish On Death",
-                "enderPearlsVanishOnDeath",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::FallDamage, "Fall Damage", "fallDamage"),
-            FieldOptions::new_bool(GameRuleKeys::FireDamage, "Fire Damage", "fireDamage"),
-            FieldOptions::new_bool(
-                GameRuleKeys::ForgiveDeadPlayers,
-                "Forgive Dead Players",
-                "forgiveDeadPlayers",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::FreezeDamage, "Freeze Damage", "freezeDamage"),
-            FieldOptions::new_bool(
-                GameRuleKeys::GlobalSoundEvents,
-                "Global Sound Events",
-                "globalSoundEvents",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::KeepInventory,
-                "Keep Inventory",
-                "keepInventory",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::LavaSourceConversion,
-                "Lava Source Conversion",
-                "lavaSourceConversion",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::LogAdminCommands,
-                "Log Admin Commands",
-                "logAdminCommands",
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::MaxCommandChainLength,
-                "Max Command Chain Length",
-                None,
-                Some(16777215),
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::MaxCommandForkCount,
-                "Max Command Fork Count",
-                None,
-                Some(16777215),
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::MaxEntityCramming,
-                "Max Entity Cramming",
-                None,
-                Some(255),
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::MobExplosionDropDecay,
-                "Mob Explosion Drop Decay",
-                "mobExplosionDropDecay",
-            ),
-            FieldOptions::new_bool(GameRuleKeys::MobGriefing, "Mob Griefing", "mobGriefing"),
-            FieldOptions::new_bool(
-                GameRuleKeys::NaturalRegeneration,
-                "Natural Regeneration",
-                "naturalRegeneration",
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::PlayersNetherPortalCreativeDelay,
-                "Players Nether Portal Creative Delay",
-                None,
-                Some(16777215),
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::PlayersNetherPortalDefaultDelay,
-                "Players Nether Portal Default Delay",
-                None,
-                Some(16777215),
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::PlayersSleepingPercentage,
-                "Players Sleeping Percentage",
-                None,
-                Some(100),
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::ProjectilesCanBreakBlocks,
-                "Projectiles Can Break Blocks",
-                "projectilesCanBreakBlocks",
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::RandomTickSpeed,
-                "Random Tick Speed",
-                None,
-                Some(4096),
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::ReducedDebugInfo,
-                "Reduced Debug Info",
-                "reducedDebugInfo",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::SendCommandFeedback,
-                "Send Command Feedback",
-                "sendCommandFeedback",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::ShowDeathMessages,
-                "Show Death Messages",
-                "showDeathMessages",
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::SnowAccumulationHeight,
-                "Snow Accumulation Height",
-                Some(1),
-                Some(8),
-            ),
-            FieldOptions::new_number(
-                GameRuleKeys::SpawnChunkRadius,
-                "Spawn Chunk Radius",
-                None,
-                Some(32),
-            ),
-            FieldOptions::new_number(GameRuleKeys::SpawnRadius, "Spawn Radius", None, Some(65536)),
-            FieldOptions::new_bool(
-                GameRuleKeys::SpectatorsGenerateChunks,
-                "Spectators Generate Chunks",
-                "spectatorsGenerateChunks",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::TntExplosionDropDecay,
-                "TNT Explosion Drop Decay",
-                "tntExplosionDropDecay",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::UniversalAnger,
-                "Universal Anger",
-                "universalAnger",
-            ),
-            FieldOptions::new_bool(
-                GameRuleKeys::WaterSourceConversion,
-                "Water Source Conversion",
-                "waterSourceConversion",
-            ),
-        ])
+        GameRuleKeys::get_gamerules()
     }
 
     fn get_gamerule_value(&self, key: GameRuleKeys) -> FieldValue {
@@ -335,9 +107,7 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
         }
     }
 
-    fn set_gamerule_value(&self, key: GameRuleKeys, value: FieldValue) {
-        println!("Game rule updated {:?} {:?}", key, value);
-    }
+    fn set_gamerule_value(&self, _key: GameRuleKeys, _value: FieldValue) {}
 
     async fn run_command(&self, command: &str) {
         println!("Command received: {}", command);
@@ -367,65 +137,10 @@ impl NyliumServer<ConfigKeys, GameRuleKeys> for DummyServer {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub enum ConfigKeys {
     Port,
     Seed,
     MaxPlayers,
     OnlineMode,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum GameRuleKeys {
-    AnnounceAdvancements,
-    BlockExplosionDropDecay,
-    CommandBlockOutput,
-    CommandModificationBlockLimit,
-    DisableElytraMovementCheck,
-    DisableRaids,
-    DoDaylightCycle,
-    DoEntityDrops,
-    DoFireTick,
-    DoImmediateRespawn,
-    DoInsomnia,
-    DoLimitedCrafting,
-    DoMobLoot,
-    DoMobSpawning,
-    DoPatrolSpawning,
-    DoTileDrops,
-    DoTraderSpawning,
-    DoVinesSpread,
-    DoWardenSpawning,
-    DoWeatherCycle,
-    DrowningDamage,
-    EnderPearlsVanishOnDeath,
-    FallDamage,
-    FireDamage,
-    ForgiveDeadPlayers,
-    FreezeDamage,
-    GlobalSoundEvents,
-    KeepInventory,
-    LavaSourceConversion,
-    LogAdminCommands,
-    MaxCommandChainLength,
-    MaxCommandForkCount,
-    MaxEntityCramming,
-    MobExplosionDropDecay,
-    MobGriefing,
-    NaturalRegeneration,
-    PlayersNetherPortalCreativeDelay,
-    PlayersNetherPortalDefaultDelay,
-    PlayersSleepingPercentage,
-    ProjectilesCanBreakBlocks,
-    RandomTickSpeed,
-    ReducedDebugInfo,
-    SendCommandFeedback,
-    ShowDeathMessages,
-    SnowAccumulationHeight,
-    SpawnChunkRadius,
-    SpawnRadius,
-    SpectatorsGenerateChunks,
-    TntExplosionDropDecay,
-    UniversalAnger,
-    WaterSourceConversion,
 }

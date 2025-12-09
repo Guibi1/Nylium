@@ -1,17 +1,20 @@
 use gpui::SharedString;
 
+#[derive(Clone)]
 pub enum FieldOptions<K> {
     Boolean(BooleanFieldOptions<K>),
     Number(NumberFieldOptions<K>),
     String(StringFieldOptions<K>),
 }
 
+#[derive(Clone)]
 pub struct BooleanFieldOptions<K> {
     pub key: K,
     pub label: SharedString,
     pub id: SharedString,
 }
 
+#[derive(Clone)]
 pub struct NumberFieldOptions<K> {
     pub key: K,
     pub label: SharedString,
@@ -19,6 +22,7 @@ pub struct NumberFieldOptions<K> {
     pub max: Option<u32>,
 }
 
+#[derive(Clone)]
 pub struct StringFieldOptions<K> {
     pub key: K,
     pub label: SharedString,
@@ -66,7 +70,7 @@ where
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub enum FieldValue {
     Boolean(bool),
     Number(u32),

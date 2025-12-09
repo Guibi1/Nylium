@@ -7,7 +7,7 @@ use gpui_component::label::Label;
 use gpui_component::scroll::{Scrollbar, ScrollbarState};
 use gpui_component::{ActiveTheme, VirtualListScrollHandle, v_virtual_list};
 use nylium_adapter::NyliumServer;
-use nylium_adapter::config::FieldOptions;
+use nylium_adapter::fields::FieldOptions;
 use nylium_assets::Assets;
 
 use crate::ui::form::{BooleanField, NumberField, StringField};

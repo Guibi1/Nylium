@@ -1,4 +1,4 @@
-use nylium_adapter::config::FieldValue;
+use nylium_adapter::fields::FieldValue;
 
 mod boolean;
 mod number;

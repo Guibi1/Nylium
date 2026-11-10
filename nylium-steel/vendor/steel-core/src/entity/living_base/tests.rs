@@ -1,0 +1,636 @@
+use glam::DVec3;
+use steel_registry::{
+    data_components::vanilla_components::{SwingAnimation, SwingAnimationType},
+    init_vanilla_registry,
+    item_stack::ItemStack,
+    vanilla_attributes, vanilla_entities,
+    vanilla_entity_data::PlayerEntityData,
+    vanilla_items, vanilla_mob_effects,
+};
+use steel_utils::{BlockPos, types::InteractionHand};
+
+use crate::behavior::init_behaviors;
+use crate::inventory::equipment::EquipmentSlot;
+
+use super::{
+    ActiveMobEffect, LivingEntityBase, LivingTravelInput, MobEffectInstance, MobEffectSyncChange,
+    POST_IMPULSE_GRACE_TICKS,
+};
+
+/// An infinite-duration effect never "ends within" anything, and the bound is inclusive.
+#[test]
+fn ends_within_treats_infinite_duration_as_never_ending() {
+    init_vanilla_registry();
+    let lasting =
+        |duration| MobEffectInstance::with_duration(vanilla_mob_effects::LUCK, duration, 0);
+
+    assert!(!lasting(-1).ends_within(20));
+    assert!(lasting(20).ends_within(20));
+    assert!(lasting(1).ends_within(20));
+    assert!(!lasting(21).ends_within(20));
+}
+
+#[test]
+fn living_constructor_initializes_health_from_max_health() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    let mut entity_data = PlayerEntityData::new();
+
+    assert_eq!(
+        entity_data.living_entity().health.get().to_bits(),
+        1.0_f32.to_bits()
+    );
+
+    base.initialize_synced_data(&mut entity_data);
+
+    assert_eq!(
+        entity_data.living_entity().health.get().to_bits(),
+        (vanilla_attributes::MAX_HEALTH.default_value as f32).to_bits()
+    );
+}
+
+#[test]
+fn absorption_amount_clamps_to_attribute_range() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    base.attributes()
+        .lock()
+        .set_base_value(vanilla_attributes::MAX_ABSORPTION, 4.0);
+
+    base.set_absorption_amount(10.0);
+    assert_eq!(base.absorption_amount().to_bits(), 4.0_f32.to_bits());
+
+    base.set_absorption_amount(-1.0);
+    assert_eq!(base.absorption_amount().to_bits(), 0.0_f32.to_bits());
+}
+
+#[test]
+fn fall_damage_starts_above_safe_fall_distance() {
+    assert_eq!(
+        LivingEntityBase::calculate_fall_damage(3.0, 1.0, 3.0, 1.0),
+        0
+    );
+    assert_eq!(
+        LivingEntityBase::calculate_fall_damage(4.0, 1.0, 3.0, 1.0),
+        1
+    );
+}
+
+#[test]
+fn last_hurt_by_player_memory_ticks_down_then_clears_reference() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PIG);
+    let player_uuid = uuid::Uuid::from_u128(7);
+
+    base.set_last_hurt_by_player(player_uuid, 2);
+
+    assert_eq!(base.last_hurt_by_player_uuid(), Some(player_uuid));
+    assert_eq!(base.last_hurt_by_player_memory_time(), 2);
+
+    base.tick_last_hurt_by_player_memory();
+
+    assert_eq!(base.last_hurt_by_player_uuid(), Some(player_uuid));
+    assert_eq!(base.last_hurt_by_player_memory_time(), 1);
+
+    base.tick_last_hurt_by_player_memory();
+
+    assert_eq!(base.last_hurt_by_player_uuid(), Some(player_uuid));
+    assert_eq!(base.last_hurt_by_player_memory_time(), 0);
+
+    base.tick_last_hurt_by_player_memory();
+
+    assert!(base.last_hurt_by_player_uuid().is_none());
+    assert_eq!(base.last_hurt_by_player_memory_time(), 0);
+}
+
+#[test]
+fn fall_damage_applies_block_and_attribute_multipliers() {
+    assert_eq!(
+        LivingEntityBase::calculate_fall_damage(8.0, 0.5, 3.0, 2.0),
+        5
+    );
+    assert_eq!(
+        LivingEntityBase::calculate_fall_damage(8.0, 0.2, 3.0, 1.0),
+        1
+    );
+}
+
+#[test]
+fn post_impulse_grace_counts_down_by_tick() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    base.apply_post_impulse_grace_time(2);
+
+    assert!(base.is_in_post_impulse_grace_time());
+    base.tick_post_impulse_grace_time();
+    assert!(base.is_in_post_impulse_grace_time());
+    base.tick_post_impulse_grace_time();
+    assert!(!base.is_in_post_impulse_grace_time());
+}
+
+#[test]
+fn post_impulse_grace_keeps_larger_existing_window() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    base.apply_post_impulse_grace_time(5);
+    base.apply_post_impulse_grace_time(2);
+
+    for _ in 0..4 {
+        base.tick_post_impulse_grace_time();
+        assert!(base.is_in_post_impulse_grace_time());
+    }
+
+    base.tick_post_impulse_grace_time();
+    assert!(!base.is_in_post_impulse_grace_time());
+}
+
+#[test]
+fn current_impulse_context_tracks_fall_damage_impact_position() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    let impact_pos = DVec3::new(1.0, 72.0, -3.0);
+
+    base.set_ignore_fall_damage_from_current_impulse(true, impact_pos);
+
+    assert!(base.is_ignoring_fall_damage_from_current_impulse());
+    assert_eq!(base.current_impulse_impact_pos(), Some(impact_pos));
+    assert!(base.is_in_post_impulse_grace_time());
+}
+
+#[test]
+fn current_impulse_context_resets_after_grace_window() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    base.set_ignore_fall_damage_from_current_impulse(true, DVec3::new(0.0, 72.0, 0.0));
+    base.apply_post_impulse_grace_time(1);
+    base.try_reset_current_impulse_context();
+    assert!(base.is_ignoring_fall_damage_from_current_impulse());
+
+    for _ in 0..POST_IMPULSE_GRACE_TICKS {
+        base.tick_post_impulse_grace_time();
+    }
+    base.try_reset_current_impulse_context();
+
+    assert!(!base.is_ignoring_fall_damage_from_current_impulse());
+    assert_eq!(base.current_impulse_impact_pos(), None);
+}
+
+#[test]
+fn fall_flying_is_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert!(!base.is_fall_flying());
+    base.set_fall_flying(true);
+    assert!(base.is_fall_flying());
+    base.set_fall_flying(false);
+    assert!(!base.is_fall_flying());
+}
+
+#[test]
+fn fall_flying_ticks_are_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert_eq!(base.fall_flying_ticks(), 0);
+    base.tick_fall_flying_state(true);
+    base.tick_fall_flying_state(true);
+    assert_eq!(base.fall_flying_ticks(), 2);
+    base.tick_fall_flying_state(false);
+    assert_eq!(base.fall_flying_ticks(), 0);
+}
+
+#[test]
+fn living_rotation_is_base_tick_snapshot_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PIG);
+
+    base.set_y_body_rot(30.0);
+    base.set_y_head_rot(45.0);
+    let rotation = base.rotation_state();
+    assert_eq!(rotation.y_body_rot().to_bits(), 30.0_f32.to_bits());
+    assert_eq!(rotation.y_body_rot_o().to_bits(), 0.0_f32.to_bits());
+    assert_eq!(rotation.y_head_rot().to_bits(), 45.0_f32.to_bits());
+    assert_eq!(rotation.y_head_rot_o().to_bits(), 0.0_f32.to_bits());
+
+    base.advance_rotation_for_base_tick();
+    let rotation = base.rotation_state();
+    assert_eq!(rotation.y_body_rot_o().to_bits(), 30.0_f32.to_bits());
+    assert_eq!(rotation.y_head_rot_o().to_bits(), 45.0_f32.to_bits());
+
+    base.set_y_body_rot(60.0);
+    base.set_y_head_rot(75.0);
+    let rotation = base.rotation_state();
+    assert_eq!(rotation.y_body_rot().to_bits(), 60.0_f32.to_bits());
+    assert_eq!(rotation.y_body_rot_o().to_bits(), 30.0_f32.to_bits());
+    assert_eq!(rotation.y_head_rot().to_bits(), 75.0_f32.to_bits());
+    assert_eq!(rotation.y_head_rot_o().to_bits(), 45.0_f32.to_bits());
+}
+
+#[test]
+fn living_swing_uses_vanilla_restart_gate() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PIG);
+    let animation = SwingAnimation::DEFAULT;
+
+    assert!(base.start_swing(InteractionHand::MainHand, animation, animation.duration));
+    // A swing can be replaced before its first tick.
+    assert!(base.start_swing(InteractionHand::OffHand, animation, animation.duration));
+    for _ in 0..animation.duration / 2 {
+        base.tick_swing_state();
+        assert!(!base.start_swing(InteractionHand::MainHand, animation, animation.duration));
+    }
+    base.tick_swing_state();
+    assert!(base.start_swing(InteractionHand::MainHand, animation, animation.duration));
+    assert_eq!(base.swing_state().swing_time(), 0);
+    assert_eq!(
+        base.swing_state().swinging_arm(),
+        Some(InteractionHand::MainHand)
+    );
+}
+
+#[test]
+fn living_swing_tick_keeps_full_progress_until_after_duration() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PIG);
+    let animation = SwingAnimation::DEFAULT;
+    assert!(base.start_swing(InteractionHand::MainHand, animation, animation.duration));
+
+    base.tick_swing_state();
+    assert_eq!(base.swing_state().attack_anim(), 0.0);
+    base.tick_swing_state();
+    assert_eq!(
+        base.swing_state().attack_anim(),
+        1.0 / animation.duration as f32
+    );
+    assert_eq!(base.swing_state().old_attack_anim(), 0.0);
+
+    for _ in 0..animation.duration - 1 {
+        base.tick_swing_state();
+    }
+    assert!(base.swing_state().swinging());
+    assert_eq!(base.swing_state().attack_anim(), 1.0);
+    base.tick_swing_state();
+    assert!(!base.swing_state().swinging());
+    assert_eq!(base.swing_state().swinging_arm(), None);
+    assert_eq!(base.swing_state().attack_anim(), 0.0);
+    assert_eq!(base.swing_state().old_attack_anim(), 1.0);
+    base.tick_swing_state();
+    assert_eq!(base.swing_state().old_attack_anim(), 0.0);
+}
+
+#[test]
+fn living_swing_restart_preserves_progress_only_for_same_description() {
+    init_vanilla_registry();
+    let animation = SwingAnimation::DEFAULT;
+    let changed_animation = SwingAnimation::new(SwingAnimationType::Stab, animation.duration);
+    for (hand, next_animation, next_duration, resets) in [
+        (
+            InteractionHand::MainHand,
+            animation,
+            animation.duration,
+            false,
+        ),
+        (
+            InteractionHand::OffHand,
+            animation,
+            animation.duration,
+            true,
+        ),
+        (
+            InteractionHand::MainHand,
+            changed_animation,
+            animation.duration,
+            true,
+        ),
+        (
+            InteractionHand::MainHand,
+            animation,
+            animation.duration + 1,
+            true,
+        ),
+    ] {
+        let base = LivingEntityBase::new(&vanilla_entities::PIG);
+        assert!(base.start_swing(InteractionHand::MainHand, animation, animation.duration));
+        for _ in 0..4 {
+            base.tick_swing_state();
+        }
+        let previous = base.swing_state();
+        assert!(base.start_swing(hand, next_animation, next_duration));
+        let restarted = base.swing_state();
+        assert_eq!(restarted.swing_time(), 0);
+        assert_eq!(
+            restarted.attack_anim(),
+            if resets { 0.0 } else { previous.attack_anim() }
+        );
+        assert_eq!(
+            restarted.old_attack_anim(),
+            if resets {
+                0.0
+            } else {
+                previous.old_attack_anim()
+            }
+        );
+    }
+}
+
+#[test]
+fn living_swing_nonpositive_duration_never_divides_by_zero() {
+    init_vanilla_registry();
+    for duration in [0, -1] {
+        let base = LivingEntityBase::new(&vanilla_entities::PIG);
+        assert!(base.start_swing(InteractionHand::MainHand, SwingAnimation::DEFAULT, duration));
+        base.tick_swing_state();
+        assert_eq!(base.swing_state().attack_anim(), 0.0);
+        assert_eq!(base.swing_state().swinging(), duration == 0);
+        base.tick_swing_state();
+        assert!(!base.swing_state().swinging());
+        assert_eq!(base.swing_state().attack_anim(), 0.0);
+    }
+}
+
+#[test]
+fn equipment_is_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert_eq!(base.equipment().lock().non_empty_items().len(), 0);
+
+    base.equipment()
+        .lock()
+        .set(EquipmentSlot::Chest, ItemStack::new(&vanilla_items::ELYTRA));
+
+    assert!(
+        base.equipment()
+            .lock()
+            .get_ref(EquipmentSlot::Chest)
+            .is(&vanilla_items::ELYTRA)
+    );
+}
+
+#[test]
+fn sprinting_is_living_entity_state_and_speed_modifier() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    let movement_speed = vanilla_attributes::MOVEMENT_SPEED;
+    let base_speed = base
+        .attributes()
+        .lock()
+        .get_value(movement_speed)
+        .expect("player should have movement speed");
+
+    assert!(!base.is_sprinting());
+    base.set_sprinting(true);
+    assert!(base.is_sprinting());
+    assert!(
+        base.attributes()
+            .lock()
+            .get_value(movement_speed)
+            .expect("player should have movement speed")
+            > base_speed
+    );
+
+    base.set_sprinting(false);
+    assert!(!base.is_sprinting());
+    assert_eq!(
+        base.attributes()
+            .lock()
+            .get_value(movement_speed)
+            .expect("player should have movement speed")
+            .to_bits(),
+        base_speed.to_bits()
+    );
+}
+
+#[test]
+fn active_mob_effect_presence_is_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert!(!base.has_mob_effect(vanilla_mob_effects::DOLPHINS_GRACE));
+    base.set_mob_effect_active(vanilla_mob_effects::DOLPHINS_GRACE, true);
+    assert!(base.has_mob_effect(vanilla_mob_effects::DOLPHINS_GRACE));
+    assert_eq!(
+        base.mob_effect(vanilla_mob_effects::DOLPHINS_GRACE),
+        Some(ActiveMobEffect::new(vanilla_mob_effects::DOLPHINS_GRACE, 0))
+    );
+    base.set_mob_effect_active(vanilla_mob_effects::DOLPHINS_GRACE, false);
+    assert!(!base.has_mob_effect(vanilla_mob_effects::DOLPHINS_GRACE));
+}
+
+#[test]
+fn active_mob_effect_amplifier_is_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    base.set_mob_effect(vanilla_mob_effects::JUMP_BOOST, 2);
+
+    assert_eq!(
+        base.mob_effect(vanilla_mob_effects::JUMP_BOOST),
+        Some(ActiveMobEffect::new(vanilla_mob_effects::JUMP_BOOST, 2))
+    );
+}
+
+#[test]
+fn mob_effect_attribute_modifiers_use_extracted_vanilla_data() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    let movement_speed = vanilla_attributes::MOVEMENT_SPEED;
+    let base_speed = base
+        .attributes()
+        .lock()
+        .get_value(movement_speed)
+        .expect("player should have movement speed");
+    let speed_modifier = &vanilla_mob_effects::SPEED.attribute_modifiers[0];
+
+    assert_eq!(speed_modifier.attribute.key, movement_speed.key);
+    assert!(base.add_mob_effect(MobEffectInstance::with_duration(
+        vanilla_mob_effects::SPEED,
+        200,
+        1
+    )));
+
+    let boosted_speed = base
+        .attributes()
+        .lock()
+        .get_value(movement_speed)
+        .expect("player should have movement speed");
+    let expected = base_speed * (1.0 + speed_modifier.amount * 2.0);
+    assert!((boosted_speed - expected).abs() < f64::EPSILON);
+
+    assert!(base.remove_mob_effect(vanilla_mob_effects::SPEED));
+    assert_eq!(
+        base.attributes()
+            .lock()
+            .get_value(movement_speed)
+            .expect("player should have movement speed")
+            .to_bits(),
+        base_speed.to_bits()
+    );
+}
+
+#[test]
+fn mob_effect_duration_tick_removes_expired_effect() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    base.add_mob_effect(MobEffectInstance::with_duration(
+        vanilla_mob_effects::DOLPHINS_GRACE,
+        1,
+        0,
+    ));
+    base.drain_dirty_mob_effects();
+
+    base.tick_mob_effect_duration(vanilla_mob_effects::DOLPHINS_GRACE);
+
+    assert!(!base.has_mob_effect(vanilla_mob_effects::DOLPHINS_GRACE));
+    assert_eq!(
+        base.drain_dirty_mob_effects(),
+        vec![MobEffectSyncChange::Remove {
+            effect: vanilla_mob_effects::DOLPHINS_GRACE
+        }]
+    );
+}
+
+#[test]
+fn stronger_shorter_effect_downgrades_to_hidden_effect() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    base.add_mob_effect(MobEffectInstance::with_duration(
+        vanilla_mob_effects::SPEED,
+        10,
+        0,
+    ));
+    base.add_mob_effect(MobEffectInstance::with_duration(
+        vanilla_mob_effects::SPEED,
+        2,
+        1,
+    ));
+    base.drain_dirty_mob_effects();
+
+    base.tick_mob_effect_duration(vanilla_mob_effects::SPEED);
+    base.tick_mob_effect_duration(vanilla_mob_effects::SPEED);
+
+    let effect = base
+        .mob_effect(vanilla_mob_effects::SPEED)
+        .expect("speed should downgrade to hidden effect");
+    assert_eq!(effect.amplifier(), 0);
+    assert_eq!(effect.duration(), 8);
+    assert_eq!(
+        base.drain_dirty_mob_effects(),
+        vec![MobEffectSyncChange::Update {
+            effect,
+            blend_for_self: false,
+        }]
+    );
+}
+
+#[test]
+fn sleeping_uses_living_entity_sleeping_position() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    let bed_pos = BlockPos::new(12, 64, -4);
+
+    assert!(!base.is_sleeping());
+    assert_eq!(base.sleeping_pos(), None);
+
+    base.set_sleeping_pos(bed_pos);
+    assert!(base.is_sleeping());
+    assert_eq!(base.sleeping_pos(), Some(bed_pos));
+
+    base.clear_sleeping_pos();
+    assert!(!base.is_sleeping());
+    assert_eq!(base.sleeping_pos(), None);
+}
+
+#[test]
+fn last_climbable_pos_is_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+    let climbable_pos = BlockPos::new(-5, 72, 3);
+
+    assert_eq!(base.last_climbable_pos(), None);
+    base.set_last_climbable_pos(climbable_pos);
+    assert_eq!(base.last_climbable_pos(), Some(climbable_pos));
+}
+
+#[test]
+fn discard_friction_is_living_entity_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert!(!base.should_discard_friction());
+    base.set_discard_friction(true);
+    assert!(base.should_discard_friction());
+    base.set_discard_friction(false);
+    assert!(!base.should_discard_friction());
+}
+
+#[test]
+fn living_travel_input_is_shared_living_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert_eq!(base.travel_input(), LivingTravelInput::ZERO);
+    base.set_travel_input(LivingTravelInput::new(1.0, 0.5, -1.0));
+    assert_eq!(base.travel_input(), LivingTravelInput::new(1.0, 0.5, -1.0));
+
+    base.dampen_travel_input();
+    assert_eq!(
+        base.travel_input(),
+        LivingTravelInput::new(0.98, 0.5, -0.98)
+    );
+}
+
+#[test]
+fn jumping_and_jump_delay_are_shared_living_state() {
+    init_vanilla_registry();
+    let base = LivingEntityBase::new(&vanilla_entities::PLAYER);
+
+    assert!(!base.is_jumping());
+    base.set_jumping(true);
+    assert!(base.is_jumping());
+
+    assert_eq!(base.no_jump_delay(), 0);
+    base.set_no_jump_delay(2);
+    base.tick_no_jump_delay();
+    assert_eq!(base.no_jump_delay(), 1);
+    base.tick_no_jump_delay();
+    base.tick_no_jump_delay();
+    assert_eq!(base.no_jump_delay(), 0);
+}
+
+#[test]
+fn poison_and_regeneration_tick_schedules_match_vanilla_interval_formulas() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    // Vanilla `PoisonMobEffect`: interval = 25 >> amplifier, applied when
+    // remaining duration is a multiple of the interval.
+    let poison = MobEffectInstance::with_duration(vanilla_mob_effects::POISON, 50, 0);
+    assert!(poison.should_apply_effect_tick_this_tick(0));
+    let poison_amplified = MobEffectInstance::with_duration(vanilla_mob_effects::POISON, 48, 1);
+    // 25 >> 1 == 12; 48 % 12 == 0.
+    assert!(poison_amplified.should_apply_effect_tick_this_tick(0));
+    let poison_off_schedule = MobEffectInstance::with_duration(vanilla_mob_effects::POISON, 49, 1);
+    assert!(!poison_off_schedule.should_apply_effect_tick_this_tick(0));
+
+    // Vanilla `RegenerationMobEffect`: interval = 50 >> amplifier.
+    let regen = MobEffectInstance::with_duration(vanilla_mob_effects::REGENERATION, 50, 0);
+    assert!(regen.should_apply_effect_tick_this_tick(0));
+    let regen_off_schedule =
+        MobEffectInstance::with_duration(vanilla_mob_effects::REGENERATION, 49, 0);
+    assert!(!regen_off_schedule.should_apply_effect_tick_this_tick(0));
+
+    // Vanilla `HungerMobEffect`: applies every tick.
+    let hunger = MobEffectInstance::with_duration(vanilla_mob_effects::HUNGER, 100, 0);
+    assert!(hunger.should_apply_effect_tick_this_tick(0));
+
+    // An effect with no vanilla tick schedule (e.g. Speed) never ticks.
+    let speed = MobEffectInstance::with_duration(vanilla_mob_effects::SPEED, 100, 0);
+    assert!(!speed.should_apply_effect_tick_this_tick(0));
+}

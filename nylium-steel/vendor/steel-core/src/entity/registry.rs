@@ -1,0 +1,451 @@
+//! Entity registry for creating entity instances.
+
+use std::ops::Deref;
+use std::sync::{OnceLock, Weak};
+
+use glam::DVec3;
+use rand::Rng;
+use simdnbt::borrow::{
+    BaseNbtCompound as BorrowedNbtCompound, NbtCompound as BorrowedNbtCompoundView,
+};
+use steel_registry::RegistryExt;
+use steel_registry::entity_type::EntityTypeRef;
+use steel_registry::{REGISTRY, RegistryEntry};
+use steel_utils::BlockPos;
+use uuid::Uuid;
+
+use super::generated_entities::{register_entity_factories, register_spawn_rules};
+use super::{
+    EntityBaseLoad, EntityBaseSaveData, EntityFireFreezeState, EntitySpawnReason, SharedEntity,
+    next_entity_id,
+};
+use crate::world::{LevelReader, World};
+
+/// Factory function type for creating entities.
+///
+/// Takes the entity type, entity ID, spawn position, and world reference.
+/// Returns a new entity instance. The entity ID should be obtained from
+/// `next_entity_id()`.
+pub type EntityFactory = fn(EntityTypeRef, i32, DVec3, Weak<World>) -> SharedEntity;
+
+/// Factory function type for loading entities from disk.
+///
+/// Takes the entity type and all base entity fields needed for reconstruction.
+pub type EntityLoadFactory = fn(EntityTypeRef, EntityBaseLoad) -> SharedEntity;
+
+/// Spawn placement predicate of an entity type.
+pub(crate) type SpawnRule =
+    fn(EntityTypeRef, &dyn LevelReader, EntitySpawnReason, BlockPos, &mut dyn Rng) -> bool;
+
+/// Entity load request before the registry assigns a runtime ID.
+pub struct EntityLoadRequest {
+    /// Entity type to instantiate.
+    pub entity_type: EntityTypeRef,
+    /// Restored entity position.
+    pub position: DVec3,
+    /// Persisted entity UUID.
+    pub uuid: Uuid,
+    /// Restored velocity.
+    pub velocity: DVec3,
+    /// Restored yaw and pitch.
+    pub rotation: (f32, f32),
+    /// Restored accumulated fall distance.
+    pub fall_distance: f64,
+    /// Restored vanilla fire/freeze state.
+    pub fire_freeze: EntityFireFreezeState,
+    /// Restored ground-contact flag.
+    pub on_ground: bool,
+    /// Restored shared vanilla save data.
+    pub save_data: EntityBaseSaveData,
+    /// World reference for the loaded entity.
+    pub world: Weak<World>,
+}
+
+impl EntityLoadRequest {
+    fn into_base_load(self) -> (EntityTypeRef, EntityBaseLoad) {
+        (
+            self.entity_type,
+            EntityBaseLoad {
+                id: next_entity_id(),
+                position: self.position,
+                uuid: self.uuid,
+                velocity: self.velocity,
+                rotation: self.rotation,
+                fall_distance: self.fall_distance,
+                fire_freeze: self.fire_freeze,
+                on_ground: self.on_ground,
+                save_data: self.save_data,
+                world: self.world,
+            },
+        )
+    }
+}
+
+/// Registry entry for an entity type.
+struct EntityEntry {
+    /// Factory function to create new instances.
+    factory: Option<EntityFactory>,
+    /// Factory function to load instances from disk.
+    load_factory: Option<EntityLoadFactory>,
+    /// Vanilla `SpawnPlacements` predicate, absent when vanilla registers none.
+    spawn_rule: Option<SpawnRule>,
+}
+
+/// Registry for entity factories and spawn rules.
+///
+/// Maps `EntityType` to factory functions that can create entity instances.
+/// This is used when loading entities from disk or when entities are spawned.
+pub struct EntityRegistry {
+    entries: Vec<EntityEntry>,
+}
+
+impl EntityRegistry {
+    fn finish_registered_load_view(entity: &SharedEntity, nbt: &BorrowedNbtCompoundView<'_, '_>) {
+        let yaw = entity.rotation().0;
+        if let Some(living) = entity.as_living_entity() {
+            living.set_y_head_rot(yaw);
+            living.set_y_body_rot(yaw);
+        }
+
+        entity.load_additional(*nbt);
+        entity.set_old_position_to_current();
+        entity.base().set_old_rotation_to_current();
+        entity.sync_base_entity_data();
+    }
+
+    /// Creates a new empty registry with entries for all entity types.
+    #[must_use]
+    pub fn new() -> Self {
+        let count = REGISTRY.entity_types.len();
+        let entries = (0..count)
+            .map(|_| EntityEntry {
+                factory: None,
+                load_factory: None,
+                spawn_rule: None,
+            })
+            .collect();
+
+        Self { entries }
+    }
+
+    /// Registers a factory function for an entity type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a factory is already registered for the entity type.
+    pub fn register(&mut self, entity_type: EntityTypeRef, factory: EntityFactory) {
+        let id = entity_type.id();
+        assert!(
+            self.entries[id].factory.is_none(),
+            "entity factory for {} is already registered",
+            entity_type.key
+        );
+        self.entries[id].factory = Some(factory);
+    }
+
+    /// Registers a load factory function for an entity type.
+    ///
+    /// The load factory is used when loading entities from disk.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a load factory is already registered for the entity type.
+    pub fn register_load(&mut self, entity_type: EntityTypeRef, factory: EntityLoadFactory) {
+        let id = entity_type.id();
+        assert!(
+            self.entries[id].load_factory.is_none(),
+            "entity load factory for {} is already registered",
+            entity_type.key
+        );
+        self.entries[id].load_factory = Some(factory);
+    }
+
+    /// Registers the spawn placement predicate of an entity type.
+    ///
+    /// # Panics
+    ///
+    /// Panics if a spawn rule is already registered for the entity type.
+    pub(crate) fn register_spawn_rule(&mut self, entity_type: EntityTypeRef, rule: SpawnRule) {
+        let id = entity_type.id();
+        assert!(
+            self.entries[id].spawn_rule.is_none(),
+            "spawn rule for {} is already registered",
+            entity_type.key
+        );
+        self.entries[id].spawn_rule = Some(rule);
+    }
+
+    /// Returns the spawn placement predicate of an entity type, if it has one.
+    ///
+    /// Read it through `SpawnPlacements`: registered predicates are only checked
+    /// against vanilla for spawner reasons.
+    #[must_use]
+    pub(super) fn spawn_rule(&self, entity_type: EntityTypeRef) -> Option<SpawnRule> {
+        self.entries.get(entity_type.id())?.spawn_rule
+    }
+
+    /// Creates a new entity instance.
+    ///
+    /// Returns `None` if no factory is registered for the given type.
+    #[must_use]
+    pub fn create(
+        &self,
+        entity_type: EntityTypeRef,
+        entity_id: i32,
+        pos: DVec3,
+        world: Weak<World>,
+    ) -> Option<SharedEntity> {
+        let id = entity_type.id();
+        self.entries
+            .get(id)?
+            .factory
+            .map(|f| f(entity_type, entity_id, pos, world))
+    }
+
+    /// Creates an entity from persisted data.
+    ///
+    /// Returns `None` and logs a warning when Steel has no load factory for the type.
+    /// Skipped entities and their passenger trees are not retained when the chunk is saved.
+    #[must_use]
+    pub fn create_and_load(
+        &self,
+        request: EntityLoadRequest,
+        nbt: &BorrowedNbtCompound<'_>,
+    ) -> Option<SharedEntity> {
+        let entity_type = request.entity_type;
+        let id = entity_type.id();
+        let Some(load_factory) = self.entries.get(id).and_then(|entry| entry.load_factory) else {
+            log::warn!(
+                "Skipping unsupported entity {} while loading",
+                entity_type.key
+            );
+            return None;
+        };
+
+        let (_, load) = request.into_base_load();
+        let entity = load_factory(entity_type, load);
+        Self::finish_registered_load_view(&entity, &nbt.into());
+        Some(entity)
+    }
+
+    /// Creates an entity for the normal spawner path from an already borrowed NBT view.
+    pub(crate) fn create_and_load_for_spawn_view(
+        &self,
+        request: EntityLoadRequest,
+        nbt: &BorrowedNbtCompoundView<'_, '_>,
+    ) -> Option<SharedEntity> {
+        let id = request.entity_type.id();
+        let entry = self.entries.get(id)?;
+        let load_factory = entry.load_factory?;
+        let (entity_type, load) = request.into_base_load();
+        let entity = load_factory(entity_type, load);
+        Self::finish_registered_load_view(&entity, nbt);
+        Some(entity)
+    }
+
+    /// Returns whether a factory is registered for the given type.
+    #[must_use]
+    pub fn has_factory(&self, entity_type: EntityTypeRef) -> bool {
+        let id = entity_type.id();
+        self.entries.get(id).is_some_and(|e| e.factory.is_some())
+    }
+
+    /// Get all entity types with a registered factory.
+    #[cfg(feature = "test-framework")]
+    pub fn get_implemented(&self) -> impl Iterator<Item = EntityTypeRef> + '_ {
+        REGISTRY
+            .entity_types
+            .iter()
+            .map(|(_, entity_type)| entity_type)
+            .filter(|&entity_type| self.has_factory(entity_type))
+    }
+}
+
+impl Default for EntityRegistry {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Wrapper for the global entity registry that implements `Deref`.
+pub struct EntityRegistryLock(OnceLock<EntityRegistry>);
+
+impl Deref for EntityRegistryLock {
+    type Target = EntityRegistry;
+
+    fn deref(&self) -> &Self::Target {
+        self.0.get().expect("Entity registry not initialized")
+    }
+}
+
+impl EntityRegistryLock {
+    /// Sets the registry. Returns `Err` if already initialized.
+    pub fn set(&self, registry: EntityRegistry) -> Result<(), EntityRegistry> {
+        self.0.set(registry)
+    }
+
+    fn get_or_init(&self, init: impl FnOnce() -> EntityRegistry) -> &EntityRegistry {
+        self.0.get_or_init(init)
+    }
+
+    /// Returns the initialized registry, if entity factories have been installed.
+    #[must_use]
+    pub fn get(&self) -> Option<&EntityRegistry> {
+        self.0.get()
+    }
+}
+
+/// Global entity registry.
+///
+/// Access via deref: `ENTITIES.create(type, entity_id, pos)`
+pub static ENTITIES: EntityRegistryLock = EntityRegistryLock(OnceLock::new());
+
+/// Initializes the global entity registry, once the main registry is frozen.
+pub fn init_entities() {
+    ENTITIES.get_or_init(|| {
+        let mut registry = EntityRegistry::new();
+        register_entity_factories(&mut registry);
+        register_spawn_rules(&mut registry);
+        registry
+    });
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+    use std::sync::Arc;
+
+    use simdnbt::borrow::read_compound as read_borrowed_compound;
+    use simdnbt::owned::NbtCompound;
+    use steel_registry::init_vanilla_registry;
+    use steel_registry::vanilla_entities;
+
+    use crate::entity::entities::PigEntity;
+
+    use super::*;
+    use crate::test_support::TestEntity;
+
+    #[test]
+    fn registered_living_load_restores_current_head_and_body_yaw() {
+        init_vanilla_registry();
+        let mut registry = EntityRegistry::new();
+        register_entity_factories(&mut registry);
+        let mut bytes = Vec::new();
+        NbtCompound::new().write(&mut bytes);
+        let borrowed = read_borrowed_compound(&mut Cursor::new(&bytes))
+            .unwrap_or_else(|error| panic!("test nbt should reborrow: {error}"));
+
+        let Some(entity) = registry.create_and_load(
+            EntityLoadRequest {
+                entity_type: &vanilla_entities::PIG,
+                position: DVec3::ZERO,
+                uuid: Uuid::from_u128(1),
+                velocity: DVec3::ZERO,
+                rotation: (135.0, -20.0),
+                fall_distance: 0.0,
+                fire_freeze: EntityFireFreezeState::new(),
+                on_ground: false,
+                save_data: EntityBaseSaveData::new(),
+                world: Weak::new(),
+            },
+            &borrowed,
+        ) else {
+            panic!("registered pig should load");
+        };
+
+        assert_eq!(entity.rotation(), (135.0, -20.0));
+        assert_eq!(entity.base().old_rotation(), (135.0, -20.0));
+        let Some(living) = entity.as_living_entity() else {
+            panic!("registered pig should expose living behavior");
+        };
+        let living_rotation = living.living_rotation_state();
+        assert_eq!(living_rotation.y_head_rot().to_bits(), 135.0_f32.to_bits());
+        assert_eq!(living_rotation.y_body_rot().to_bits(), 135.0_f32.to_bits());
+        assert_eq!(living_rotation.y_head_rot_o().to_bits(), 0.0_f32.to_bits());
+        assert_eq!(living_rotation.y_body_rot_o().to_bits(), 0.0_f32.to_bits());
+    }
+
+    #[test]
+    fn create_and_load_skips_unregistered_entity_type() {
+        init_vanilla_registry();
+        let registry = EntityRegistry::new();
+        let mut bytes = Vec::new();
+        NbtCompound::new().write(&mut bytes);
+        let borrowed =
+            read_borrowed_compound(&mut Cursor::new(&bytes)).expect("test nbt should reborrow");
+
+        let entity = registry.create_and_load(
+            EntityLoadRequest {
+                entity_type: &vanilla_entities::VILLAGER,
+                position: DVec3::new(1.0, 2.0, 3.0),
+                uuid: Uuid::from_u128(1),
+                velocity: DVec3::new(0.1, 0.0, 0.2),
+                rotation: (45.0, 10.0),
+                fall_distance: 2.25,
+                fire_freeze: EntityFireFreezeState::new(),
+                on_ground: true,
+                save_data: EntityBaseSaveData {
+                    no_gravity: true,
+                    invulnerable: true,
+                    ..EntityBaseSaveData::new()
+                },
+                world: Weak::new(),
+            },
+            &borrowed,
+        );
+
+        assert!(entity.is_none());
+    }
+
+    #[test]
+    fn create_forwards_entity_type_to_factory() {
+        init_vanilla_registry();
+        let mut registry = EntityRegistry::new();
+        registry.register(
+            &vanilla_entities::OAK_BOAT,
+            |entity_type, id, pos, world| TestEntity::shared(id, pos, world, entity_type),
+        );
+
+        let Some(entity) =
+            registry.create(&vanilla_entities::OAK_BOAT, 5, DVec3::ZERO, Weak::new())
+        else {
+            panic!("registered entity factory should create an entity");
+        };
+
+        assert_eq!(entity.entity_type(), &vanilla_entities::OAK_BOAT);
+    }
+
+    #[test]
+    fn strict_load_needs_only_an_nbt_factory() {
+        init_vanilla_registry();
+        let mut registry = EntityRegistry::new();
+        registry.register_load(&vanilla_entities::PIG, |entity_type, load| {
+            let entity: SharedEntity = Arc::new(PigEntity::from_saved(entity_type, load));
+            entity
+        });
+        assert!(!registry.has_factory(&vanilla_entities::PIG));
+
+        let mut bytes = Vec::new();
+        NbtCompound::new().write(&mut bytes);
+        let borrowed = read_borrowed_compound(&mut Cursor::new(&bytes))
+            .unwrap_or_else(|error| panic!("test nbt should reborrow: {error}"));
+        let borrowed_view: BorrowedNbtCompoundView<'_, '_> = (&borrowed).into();
+        let entity = registry.create_and_load_for_spawn_view(
+            EntityLoadRequest {
+                entity_type: &vanilla_entities::PIG,
+                position: DVec3::ZERO,
+                uuid: Uuid::from_u128(1),
+                velocity: DVec3::ZERO,
+                rotation: (0.0, 0.0),
+                fall_distance: 0.0,
+                fire_freeze: EntityFireFreezeState::new(),
+                on_ground: false,
+                save_data: EntityBaseSaveData::new(),
+                world: Weak::new(),
+            },
+            &borrowed_view,
+        );
+
+        assert!(entity.is_some());
+    }
+}

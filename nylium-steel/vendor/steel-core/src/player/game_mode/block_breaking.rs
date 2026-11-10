@@ -1,0 +1,643 @@
+//! Block breaking state machine for players.
+//!
+//! This module implements the logic from Java's `ServerPlayerGameMode` for handling
+//! block breaking, including progress tracking and validation.
+
+use std::sync::Arc;
+
+use steel_protocol::packets::game::CBlockUpdate;
+use steel_registry::attribute::AttributeRef;
+use steel_registry::blocks::block_state_ext::BlockStateExt;
+use steel_registry::equipment::EquipmentSlot;
+use steel_registry::stat::vanilla_stat_types;
+use steel_registry::{
+    REGISTRY, blocks::properties::Direction, item_stack::ItemStack, level_events, vanilla_blocks,
+    vanilla_game_events,
+};
+use steel_registry::{vanilla_attributes, vanilla_mob_effects};
+use steel_utils::{
+    BlockPos, BlockStateId,
+    types::{GameType, InteractionHand, UpdateFlags},
+};
+
+use crate::behavior::{BLOCK_BEHAVIORS, BlockLootContext};
+use crate::block_entity::BlockEntity;
+use crate::entity::{ActiveMobEffect, Entity, LivingEntity};
+use crate::fluid::fluid_state_to_block;
+use crate::player::Player;
+use crate::player::food_data::food_constants;
+use crate::world::{ConditionalBlockSetResult, World, game_event::GameEventContext};
+
+use super::adventure_mode;
+
+impl Player {
+    /// Mining speed for `state` with the held item, after attributes, effects and
+    /// position penalties.
+    fn get_destroy_speed(&self, state: BlockStateId) -> f32 {
+        let mut speed = {
+            let inv = self.inventory.lock();
+            inv.get_item_in_hand(InteractionHand::MainHand)
+                .get_destroy_speed(state)
+        };
+
+        let attributes = self.attributes().lock();
+        let attribute_value = |attribute: AttributeRef| {
+            attributes
+                .get_value(attribute)
+                .unwrap_or(attribute.default_value) as f32
+        };
+
+        // TODO: Efficiency and Aqua Affinity have no effect until the enchantment
+        // `attributes` effect (`EnchantmentHelper.runLocationChangedEffects`) installs
+        // its attribute modifiers on equipment changes.
+        if speed > 1.0 {
+            speed += attribute_value(vanilla_attributes::MINING_EFFICIENCY);
+        }
+
+        let haste = self.mob_effect(vanilla_mob_effects::HASTE);
+        let conduit_power = self.mob_effect(vanilla_mob_effects::CONDUIT_POWER);
+        let dig_speed_amplifier = haste
+            .iter()
+            .chain(conduit_power.iter())
+            .map(ActiveMobEffect::amplifier)
+            .max();
+        if let Some(amplifier) = dig_speed_amplifier {
+            speed *= 1.0 + (amplifier + 1) as f32 * 0.2;
+        }
+
+        if let Some(mining_fatigue) = self.mob_effect(vanilla_mob_effects::MINING_FATIGUE) {
+            speed *= 0.3_f32.powi(mining_fatigue.amplifier() + 1);
+        }
+
+        speed *= attribute_value(vanilla_attributes::BLOCK_BREAK_SPEED);
+        if self.is_eye_in_water() {
+            speed *= attribute_value(vanilla_attributes::SUBMERGED_MINING_SPEED);
+        }
+
+        if !self.on_ground() {
+            speed /= 5.0;
+        }
+
+        speed
+    }
+
+    /// Mirrors vanilla `Player.blockActionRestricted` for block breaking.
+    pub(super) fn block_action_restricted(&self, world: &World, pos: BlockPos) -> bool {
+        let game_mode = self.game_mode();
+        if !matches!(game_mode, GameType::Adventure | GameType::Spectator) {
+            return false;
+        }
+        if game_mode == GameType::Spectator {
+            return true;
+        }
+        if self.abilities.lock().may_build {
+            return false;
+        }
+
+        let item = {
+            let inventory = self.inventory.lock();
+            let item = inventory.get_selected_item();
+            if item.is_empty() {
+                return true;
+            }
+            item.clone()
+        };
+        !adventure_mode::can_break(&item, world, pos)
+    }
+}
+
+/// Manages the block breaking state for a player.
+///
+/// Based on Java's `ServerPlayerGameMode` fields and logic.
+pub struct BlockBreakingManager {
+    /// Whether the player is currently breaking a block.
+    is_destroying_block: bool,
+    /// The tick when destruction started.
+    destroy_progress_start: u64,
+    /// The position of the block being destroyed.
+    destroy_pos: BlockPos,
+    /// The face being mined, used as the data value for the destroy-progress level event.
+    destroy_direction: Direction,
+    /// The current game tick counter.
+    game_ticks: u64,
+    /// Whether there's a delayed destroy pending (for slow mining).
+    has_delayed_destroy: bool,
+    /// Position of the delayed destroy.
+    delayed_destroy_pos: BlockPos,
+    /// The tick when delayed destroy started.
+    delayed_tick_start: u64,
+    /// The last sent destruction progress state (0-9, or -1 for none).
+    last_sent_state: i32,
+}
+
+impl Default for BlockBreakingManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl BlockBreakingManager {
+    /// Creates a new block breaking manager.
+    #[must_use]
+    pub const fn new() -> Self {
+        Self {
+            is_destroying_block: false,
+            destroy_progress_start: 0,
+            destroy_pos: BlockPos::new(0, 0, 0),
+            destroy_direction: Direction::Down,
+            game_ticks: 0,
+            has_delayed_destroy: false,
+            delayed_destroy_pos: BlockPos::new(0, 0, 0),
+            delayed_tick_start: 0,
+            last_sent_state: -1,
+        }
+    }
+
+    /// Ticks the block breaking manager.
+    ///
+    /// This handles delayed destruction and updates break progress.
+    pub fn tick(&mut self, player: &Player, world: &Arc<World>) {
+        self.game_ticks += 1;
+
+        if self.has_delayed_destroy {
+            let state = world.get_block_state(self.delayed_destroy_pos);
+            if is_air(state) {
+                self.has_delayed_destroy = false;
+            } else {
+                let progress = self.increment_destroy_progress(
+                    player,
+                    world,
+                    state,
+                    self.delayed_destroy_pos,
+                    self.delayed_tick_start,
+                );
+                if progress >= 1.0 {
+                    self.has_delayed_destroy = false;
+                    self.destroy_block(player, world, self.delayed_destroy_pos);
+                }
+            }
+        } else if self.is_destroying_block {
+            let state = world.get_block_state(self.destroy_pos);
+            if is_air(state) {
+                // Block was broken by something else
+                world.broadcast_block_destruction(player.id(), self.destroy_pos, -1);
+                self.last_sent_state = -1;
+                self.is_destroying_block = false;
+            } else {
+                let ticks_spent_destroying =
+                    self.game_ticks.saturating_sub(self.destroy_progress_start);
+                let event = if ticks_spent_destroying.is_multiple_of(4) {
+                    level_events::PARTICLES_AND_SOUND_DESTROY_PROGRESS
+                } else {
+                    level_events::PARTICLES_DESTROY_PROGRESS
+                };
+
+                self.increment_destroy_progress(
+                    player,
+                    world,
+                    state,
+                    self.destroy_pos,
+                    self.destroy_progress_start,
+                );
+                world.level_event(
+                    event,
+                    self.destroy_pos,
+                    self.destroy_direction.get_3d_data_value(),
+                    None,
+                );
+            }
+        }
+    }
+
+    /// Calculates and updates destruction progress, broadcasting to clients.
+    fn increment_destroy_progress(
+        &mut self,
+        player: &Player,
+        world: &Arc<World>,
+        block_state: BlockStateId,
+        pos: BlockPos,
+        destroy_start_tick: u64,
+    ) -> f32 {
+        let ticks_spent = self.game_ticks.saturating_sub(destroy_start_tick);
+        let destroy_speed = get_destroy_progress(player, block_state);
+        let progress = destroy_speed * (ticks_spent + 1) as f32;
+        let state = (progress * 10.0) as i32;
+
+        if state != self.last_sent_state {
+            world.broadcast_block_destruction(player.id(), pos, state);
+            self.last_sent_state = state;
+        }
+
+        progress
+    }
+
+    /// Handles a block break action from the client.
+    ///
+    /// Note: The caller (packet handler) is responsible for calling `ack_block_changes_up_to`
+    /// after this method returns, matching vanilla behavior.
+    pub fn handle_block_break_action(
+        &mut self,
+        player: &Player,
+        world: &Arc<World>,
+        pos: BlockPos,
+        action: BlockBreakAction,
+        direction: Direction,
+    ) {
+        // Validate interaction range
+        if !player.is_within_block_interaction_range(pos) {
+            if self.is_destroying_block && action == BlockBreakAction::Abort {
+                self.abort_destroy_block(player, world, pos);
+            }
+            return;
+        }
+
+        // Validate Y coordinate
+        if pos.y() >= world.max_build_height() {
+            player.send_packet(CBlockUpdate {
+                pos,
+                block_state: world.get_block_state(pos),
+            });
+            return;
+        }
+
+        match action {
+            BlockBreakAction::ChangeDirection => {
+                self.destroy_direction = direction;
+            }
+
+            BlockBreakAction::Start => {
+                // Check may_interact permission
+                if !world.may_interact(player, pos) {
+                    player.send_packet(CBlockUpdate {
+                        pos,
+                        block_state: world.get_block_state(pos),
+                    });
+                    return;
+                }
+
+                // Creative mode: instant break
+                if player.game_mode() == GameType::Creative {
+                    self.destroy_and_ack(player, world, pos);
+                    return;
+                }
+
+                if player.block_action_restricted(world, pos) {
+                    player.send_packet(CBlockUpdate {
+                        pos,
+                        block_state: world.get_block_state(pos),
+                    });
+                    return;
+                }
+
+                self.destroy_progress_start = self.game_ticks;
+                let block_state = world.get_block_state(pos);
+
+                if !is_air(block_state) {
+                    // TODO: Call EnchantmentHelper.onHitBlock before blockState.attack.
+                    BLOCK_BEHAVIORS
+                        .get_behavior(block_state.get_block())
+                        .attack(block_state, world, pos, player);
+
+                    let progress = get_destroy_progress(player, block_state);
+
+                    if progress >= 1.0 {
+                        // Insta-mine
+                        self.destroy_and_ack(player, world, pos);
+                    } else {
+                        // Start breaking
+                        if self.is_destroying_block {
+                            // Send block update for the old position to cancel client prediction
+                            player.send_packet(CBlockUpdate {
+                                pos: self.destroy_pos,
+                                block_state: world.get_block_state(self.destroy_pos),
+                            });
+                        }
+
+                        self.is_destroying_block = true;
+                        self.destroy_pos = pos;
+                        self.destroy_direction = direction;
+                        let state = (progress * 10.0) as i32;
+                        world.broadcast_block_destruction(player.id(), pos, state);
+                        self.last_sent_state = state;
+                    }
+                }
+            }
+
+            BlockBreakAction::Stop => {
+                if pos == self.destroy_pos {
+                    let ticks_spent = self.game_ticks.saturating_sub(self.destroy_progress_start);
+                    let block_state = world.get_block_state(pos);
+
+                    if !is_air(block_state) {
+                        let destroy_speed = get_destroy_progress(player, block_state);
+                        let progress = destroy_speed * (ticks_spent + 1) as f32;
+
+                        if progress >= 0.7 {
+                            // Complete the break
+                            self.is_destroying_block = false;
+                            world.broadcast_block_destruction(player.id(), pos, -1);
+                            self.destroy_and_ack(player, world, pos);
+                            return;
+                        }
+
+                        if !self.has_delayed_destroy {
+                            // Set up delayed destroy
+                            self.is_destroying_block = false;
+                            self.has_delayed_destroy = true;
+                            self.delayed_destroy_pos = pos;
+                            self.delayed_tick_start = self.destroy_progress_start;
+                        }
+                    }
+                }
+            }
+
+            BlockBreakAction::Abort => {
+                self.abort_destroy_block(player, world, pos);
+            }
+        }
+    }
+
+    fn abort_destroy_block(&mut self, player: &Player, world: &Arc<World>, pos: BlockPos) {
+        self.is_destroying_block = false;
+
+        if self.destroy_pos != pos {
+            log::warn!(
+                "Mismatch in destroy block pos: {:?} vs {:?}",
+                self.destroy_pos,
+                pos
+            );
+            world.broadcast_block_destruction(player.id(), self.destroy_pos, -1);
+        }
+
+        world.broadcast_block_destruction(player.id(), pos, -1);
+    }
+
+    /// Destroys a block and sends appropriate response.
+    fn destroy_and_ack(&mut self, player: &Player, world: &Arc<World>, pos: BlockPos) {
+        if !self.destroy_block(player, world, pos) {
+            // Send block update to resync client
+            player.send_packet(CBlockUpdate {
+                pos,
+                block_state: world.get_block_state(pos),
+            });
+        }
+    }
+
+    /// Destroys a block at the given position.
+    ///
+    /// Returns true if the block was successfully destroyed.
+    #[expect(
+        clippy::unused_self,
+        reason = "method belongs logically to BlockBreakingManager and will use self when additional state is added"
+    )]
+    fn destroy_block(&self, player: &Player, world: &Arc<World>, pos: BlockPos) -> bool {
+        let state = world.get_block_state(pos);
+
+        if player.get_abilities().instabuild && !held_item_can_destroy_in_creative(player) {
+            return false;
+        }
+
+        // Get block info
+        let Some(_block) = REGISTRY.blocks.by_state_id(state) else {
+            return false;
+        };
+
+        // TODO: Check for GameMasterBlock (command blocks, etc.)
+
+        if player.block_action_restricted(world, pos) {
+            return false;
+        }
+
+        let behavior = BLOCK_BEHAVIORS.get_behavior(state.get_block());
+        let adjusted_state = behavior.player_will_destroy(state, world, pos, player);
+        world.game_event(
+            &vanilla_game_events::BLOCK_DESTROY,
+            pos,
+            &GameEventContext::new(Some(player), Some(adjusted_state)),
+        );
+        let state_after_player_will_destroy = world.get_block_state(pos);
+
+        // Vanilla parity: fluidState.createLegacyBlock() — breaking a waterlogged
+        // block leaves water behind instead of air.
+        let replacement = fluid_state_to_block(state.get_fluid_state());
+
+        // Read before the removal below, so loot generation still sees the
+        // block entity's contents.
+        let block_entity = world.get_block_entity(pos);
+
+        // Vanilla removes the live state after `playerWillDestroy`; tripwire uses
+        // that callback to set DISARMED before the same block is removed.
+        let removed_by_player_break = !state_after_player_will_destroy.is_air()
+            && world.set_block_if_unchanged(
+                pos,
+                state_after_player_will_destroy,
+                replacement,
+                UpdateFlags::UPDATE_ALL,
+            ) == ConditionalBlockSetResult::Changed;
+        let changed_by_player_will_destroy = state_after_player_will_destroy != state;
+        let changed = changed_by_player_will_destroy || removed_by_player_break;
+
+        if removed_by_player_break {
+            behavior.destroy(adjusted_state, world, pos);
+
+            // Play block destruction particles and sound (skip for fire blocks like vanilla)
+            // Exclude the breaking player as they see the effect client-side
+            let block = REGISTRY.blocks.by_state_id(adjusted_state);
+            let is_fire = block.is_some_and(|b| {
+                b.key == vanilla_blocks::FIRE.key || b.key == vanilla_blocks::SOUL_FIRE.key
+            });
+            if !is_fire {
+                world.destroy_block_effect(pos, u32::from(adjusted_state.0), Some(player.id()));
+            }
+
+            // Vanilla snapshots the tool before Item.mineBlock can damage or
+            // consume it, then uses that snapshot for loot and post-break effects.
+            let (has_correct_tool, destroyed_with) = {
+                let inv = player.inventory.lock();
+                let main_hand = inv.get_item_in_hand(InteractionHand::MainHand);
+                (
+                    main_hand.is_correct_tool_for_drops(adjusted_state)
+                        || !requires_correct_tool(adjusted_state),
+                    main_hand.copy_with_count(main_hand.count),
+                )
+            };
+
+            // Damage the tool if the block has non-zero destroy time
+            // This is done before playerDestroy, matching vanilla's Item.mineBlock
+            let block_destroy_time = REGISTRY
+                .blocks
+                .by_state_id(adjusted_state)
+                .map_or(0.0, |b| b.config.destroy_time);
+
+            if block_destroy_time != 0.0 {
+                let broke = {
+                    let mut inv = player.inventory.lock();
+                    let damage_per_block = inv.get_selected_item().get_tool_damage_per_block();
+
+                    if damage_per_block > 0 {
+                        // Use with_selected_item_mut to ensure set_changed() is called
+                        // Skip damage if player has infinite materials (creative mode)
+                        let has_infinite_materials = player.has_infinite_materials();
+                        inv.with_selected_item_mut(|main_hand| {
+                            let item = main_hand.item;
+                            main_hand
+                                .hurt_and_break(damage_per_block, has_infinite_materials)
+                                .then_some(item)
+                        })
+                    } else {
+                        None
+                    }
+                };
+
+                if let Some(item) = broke {
+                    player.on_equipped_item_broken(item, EquipmentSlot::MainHand);
+                    log::debug!("Tool broke while mining block at {pos:?}");
+                }
+            }
+
+            // Handle drops (skip for creative/spectator)
+            let game_mode = player.game_mode();
+            if game_mode != GameType::Spectator
+                && game_mode != GameType::Creative
+                && has_correct_tool
+            {
+                player.award_stat(&vanilla_stat_types::BLOCK_MINED, state.get_block());
+                player.cause_food_exhaustion(food_constants::EXHAUSTION_MINE);
+
+                drop_block_loot(
+                    player,
+                    world,
+                    pos,
+                    adjusted_state,
+                    &destroyed_with,
+                    block_entity.as_deref(),
+                );
+                behavior.player_destroy(
+                    world,
+                    player,
+                    pos,
+                    adjusted_state,
+                    block_entity.as_ref(),
+                    &destroyed_with,
+                );
+            }
+        }
+
+        changed
+    }
+}
+
+/// Block break action types.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockBreakAction {
+    /// Player started breaking a block.
+    Start,
+    /// Player redirected the block-break raycast without resetting progress.
+    ChangeDirection,
+    /// Player stopped breaking a block (finished or released).
+    Stop,
+    /// Player aborted breaking a block.
+    Abort,
+}
+
+fn held_item_can_destroy_in_creative(player: &Player) -> bool {
+    let inventory = player.inventory.lock();
+    let main_hand = inventory.get_item_in_hand(InteractionHand::MainHand);
+    main_hand.can_destroy_blocks_in_creative()
+}
+
+/// Checks if a block state is air.
+fn is_air(state: BlockStateId) -> bool {
+    let Some(block) = REGISTRY.blocks.by_state_id(state) else {
+        return true;
+    };
+    block.config.is_air
+}
+
+/// Checks if a block requires the correct tool for drops.
+fn requires_correct_tool(state: BlockStateId) -> bool {
+    let Some(block) = REGISTRY.blocks.by_state_id(state) else {
+        return false;
+    };
+    block.config.requires_correct_tool_for_drops
+}
+
+/// Gets the destroy progress per tick for a block.
+///
+/// This is based on the vanilla formula:
+/// `1.0 / (destroy_time * 30.0)` for survival with correct tool
+/// `1.0 / (destroy_time * 100.0)` for survival with wrong tool
+/// Instant break for creative mode.
+fn get_destroy_progress(player: &Player, block_state: BlockStateId) -> f32 {
+    let Some(block) = REGISTRY.blocks.by_state_id(block_state) else {
+        return 0.0;
+    };
+
+    let destroy_time = block.config.destroy_time;
+
+    // Instant break for creative
+    if player.game_mode() == GameType::Creative {
+        return 1.0;
+    }
+
+    // Unbreakable block
+    if destroy_time < 0.0 {
+        return 0.0;
+    }
+
+    // Instant break for destroy_time == 0
+    if destroy_time == 0.0 {
+        return 1.0;
+    }
+
+    let speed = player.get_destroy_speed(block_state);
+
+    let has_correct_tool = {
+        let inv = player.inventory.lock();
+        let main_hand = inv.get_item_in_hand(InteractionHand::MainHand);
+        main_hand.is_correct_tool_for_drops(block_state)
+    };
+
+    // Calculate destroy progress per tick
+    // Vanilla formula: speed / hardness / (hasCorrectTool ? 30 : 100)
+    let divisor = if has_correct_tool || !block.config.requires_correct_tool_for_drops {
+        30.0
+    } else {
+        100.0
+    };
+
+    speed / destroy_time / divisor
+}
+
+/// Drops loot for a destroyed block using its loot table.
+fn drop_block_loot(
+    player: &Player,
+    world: &Arc<World>,
+    pos: BlockPos,
+    state: BlockStateId,
+    tool: &ItemStack,
+    block_entity: Option<&dyn BlockEntity>,
+) {
+    let luck = player
+        .attributes()
+        .lock()
+        .get_value(vanilla_attributes::LUCK)
+        .unwrap_or(0.0) as f32;
+
+    let drops = BlockLootContext::new(world, pos)
+        .with_luck(luck)
+        .with_tool(tool)
+        .with_block_entity(block_entity)
+        .get_drops(state);
+
+    // Spawn each dropped item using the player's world reference (Arc<World>)
+    for item in drops {
+        if !item.is_empty() {
+            player.get_world().pop_resource(pos, item);
+        }
+    }
+
+    BLOCK_BEHAVIORS
+        .get_behavior(state.get_block())
+        .spawn_after_break(state, world, pos, tool, true);
+}

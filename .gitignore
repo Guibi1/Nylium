@@ -1,1 +1,7 @@
-/target
+target/
+/config/
+/saves/
+/.logs/
+/pumpkin.toml
+/data/
+/world/

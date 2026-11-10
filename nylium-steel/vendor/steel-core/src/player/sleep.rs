@@ -1,0 +1,349 @@
+use glam::DVec3;
+use steel_protocol::packets::game::{AnimateAction, CAnimate};
+use steel_registry::{
+    blocks::{block_state_ext::BlockStateExt as _, properties::BlockStateProperties},
+    dimension_type::{BedRule, BedRuleValue},
+    stat::custom::CustomStatRef,
+    vanilla_blocks, vanilla_custom_stats,
+};
+use steel_utils::{BlockPos, Direction, WorldAabb, types::GameType};
+use text_components::{TextComponent, translation::TranslatedMessage};
+
+use super::sleep_state::SLEEP_DURATION;
+use super::{Player, PlayerRespawnConfig};
+use crate::{
+    entity::{Entity, LivingEntity as _},
+    level_data::RespawnData,
+    world::World,
+};
+
+const BED_INTERACTION_XZ_RANGE: f64 = 3.0;
+const BED_INTERACTION_Y_RANGE: f64 = 2.0;
+const MONSTER_SEARCH_XZ_RANGE: f64 = 8.0;
+const MONSTER_SEARCH_Y_RANGE: f64 = 5.0;
+
+#[derive(Debug)]
+pub(crate) enum BedSleepingProblem {
+    OtherProblem,
+    NotSafe(Box<TextComponent>),
+    Message(Box<TextComponent>),
+}
+
+impl BedSleepingProblem {
+    #[must_use]
+    pub(crate) fn message(&self) -> Option<&TextComponent> {
+        match self {
+            Self::Message(message) | Self::NotSafe(message) => Some(message.as_ref()),
+            Self::OtherProblem => None,
+        }
+    }
+}
+
+impl Player {
+    /// Checks for monsters within 8 blocks horizontally and 5 vertically of the bed.
+    fn monster_prevents_rest(&self, pos: BlockPos) -> bool {
+        let world = self.get_world();
+        let center = DVec3::from(pos.get_bottom_center());
+        let search = WorldAabb::new(
+            center.x - MONSTER_SEARCH_XZ_RANGE,
+            center.y - MONSTER_SEARCH_Y_RANGE,
+            center.z - MONSTER_SEARCH_XZ_RANGE,
+            center.x + MONSTER_SEARCH_XZ_RANGE,
+            center.y + MONSTER_SEARCH_Y_RANGE,
+            center.z + MONSTER_SEARCH_XZ_RANGE,
+        );
+        world.has_entity_in_aabb_matching(&search, |entity| {
+            entity
+                .as_monster()
+                .is_some_and(|monster| monster.is_preventing_player_rest(&world, self))
+        })
+    }
+}
+
+impl Player {
+    pub(crate) fn bed_rule_for(world: &World, state: steel_utils::BlockStateId) -> &BedRule {
+        if state.get_block() == &vanilla_blocks::STRAW_BED {
+            &world.dimension_type.straw_bed_rule
+        } else {
+            &world.dimension_type.bed_rule
+        }
+    }
+
+    pub(super) fn bed_rule_value_allows_in_world(world: &World, value: BedRuleValue) -> bool {
+        match value {
+            BedRuleValue::Always => true,
+            BedRuleValue::WhenDark => world.is_dark_outside(),
+            BedRuleValue::Never => false,
+        }
+    }
+
+    pub(super) fn bed_rule_value_allows(&self, value: BedRuleValue) -> bool {
+        Self::bed_rule_value_allows_in_world(&self.get_world(), value)
+    }
+
+    fn bed_rule_problem_message(rule: &BedRule) -> Option<TextComponent> {
+        rule.error_message.map(|message| message())
+    }
+
+    fn bed_sleep_problem(rule: &BedRule) -> BedSleepingProblem {
+        Self::bed_rule_problem_message(rule).map_or(BedSleepingProblem::OtherProblem, |message| {
+            BedSleepingProblem::Message(Box::new(message))
+        })
+    }
+
+    fn is_reachable_bed_block_from_position(player_pos: DVec3, bed_block_pos: BlockPos) -> bool {
+        let bed_center = DVec3::new(
+            f64::from(bed_block_pos.x()) + 0.5,
+            f64::from(bed_block_pos.y()),
+            f64::from(bed_block_pos.z()) + 0.5,
+        );
+        (player_pos.x - bed_center.x).abs() <= BED_INTERACTION_XZ_RANGE
+            && (player_pos.y - bed_center.y).abs() <= BED_INTERACTION_Y_RANGE
+            && (player_pos.z - bed_center.z).abs() <= BED_INTERACTION_XZ_RANGE
+    }
+
+    fn bed_in_range(&self, pos: BlockPos, direction: Direction) -> bool {
+        Self::bed_in_range_from_position(self.position(), pos, direction)
+    }
+
+    fn bed_in_range_from_position(player_pos: DVec3, pos: BlockPos, direction: Direction) -> bool {
+        Self::is_reachable_bed_block_from_position(player_pos, pos)
+            || Self::is_reachable_bed_block_from_position(
+                player_pos,
+                direction.opposite().relative(pos),
+            )
+    }
+
+    fn bed_blocked(&self, pos: BlockPos, direction: Direction) -> bool {
+        Self::bed_blocked_with_free_at(pos, direction, |pos| self.free_at(pos))
+    }
+
+    fn bed_blocked_with_free_at(
+        pos: BlockPos,
+        direction: Direction,
+        mut free_at: impl FnMut(BlockPos) -> bool,
+    ) -> bool {
+        let above = pos.above();
+        !free_at(above) || !free_at(direction.opposite().relative(above))
+    }
+
+    fn free_at(&self, pos: BlockPos) -> bool {
+        !self.get_world().get_block_state(pos).is_suffocating()
+    }
+
+    pub(crate) fn stop_sleep_in_bed(&self, forceful_wakeup: bool, update_level_list: bool) {
+        if self.is_sleeping() {
+            let packet = CAnimate::new(self.id(), AnimateAction::WakeUp);
+            self.get_world()
+                .broadcast_to_entity_trackers(self.id(), packet.clone(), None);
+            self.send_packet(packet);
+        }
+
+        self.default_stop_sleeping();
+        if update_level_list {
+            self.get_world().update_sleeping_player_list();
+        }
+        self.set_sleep_counter(if forceful_wakeup { 0 } else { SLEEP_DURATION });
+        let (yaw, pitch) = self.rotation();
+        if let Err(error) = self.teleport(self.position(), yaw, pitch) {
+            log::warn!(
+                "Failed to teleport player {} after waking up: {error}",
+                self.id()
+            );
+        }
+        self.sync_entity_data();
+    }
+
+    pub(crate) fn start_sleep_in_bed(
+        &self,
+        pos: BlockPos,
+        rule: &BedRule,
+        slept_in_stat: CustomStatRef,
+    ) -> Result<(), BedSleepingProblem> {
+        let world = self.get_world();
+        let direction = world
+            .get_block_state(pos)
+            .get_value(&BlockStateProperties::HORIZONTAL_FACING);
+        if self.is_sleeping() || !Entity::is_alive(self) {
+            return Err(BedSleepingProblem::OtherProblem);
+        }
+
+        let can_sleep = self.bed_rule_value_allows(rule.can_sleep);
+        let can_set_spawn = self.bed_rule_value_allows(rule.can_set_spawn);
+        if !self.bed_in_range(pos, direction) {
+            return Err(BedSleepingProblem::Message(Box::new(
+                TranslatedMessage {
+                    key: "block.minecraft.bed.too_far_away".into(),
+                    fallback: None,
+                    args: None,
+                }
+                .component(),
+            )));
+        }
+        if self.bed_blocked(pos, direction) {
+            return Err(BedSleepingProblem::Message(Box::new(
+                TranslatedMessage {
+                    key: "block.minecraft.bed.obstructed".into(),
+                    fallback: None,
+                    args: None,
+                }
+                .component(),
+            )));
+        }
+
+        if can_set_spawn {
+            self.set_respawn_position(
+                Some(PlayerRespawnConfig::new(
+                    RespawnData::of(world.key.clone(), pos, self.rotation().0, self.rotation().1),
+                    false,
+                )),
+                true,
+            );
+        }
+        if !can_sleep {
+            return Err(Self::bed_sleep_problem(rule));
+        }
+
+        if self.game_mode() != GameType::Creative && self.monster_prevents_rest(pos) {
+            return Err(BedSleepingProblem::NotSafe(Box::new(
+                TranslatedMessage {
+                    key: "block.minecraft.bed.not_safe".into(),
+                    fallback: None,
+                    args: None,
+                }
+                .component(),
+            )));
+        }
+
+        self.set_sleep_counter(0);
+        if self.start_sleeping(pos).is_err() {
+            return Err(BedSleepingProblem::OtherProblem);
+        }
+
+        self.reset_custom_stat(&vanilla_custom_stats::TIME_SINCE_REST);
+        let (yaw, pitch) = self.rotation();
+        if let Err(error) = self.teleport(self.position(), yaw, pitch) {
+            log::warn!(
+                "Failed to teleport player {} after starting sleep: {error}",
+                self.id()
+            );
+        }
+        self.sync_entity_data();
+        self.award_custom_stat(slept_in_stat);
+
+        // TODO: trigger CriteriaTriggers.SLEPT_IN_BED once the foundation for advancements exist.
+        if !world.can_sleep_through_nights() {
+            self.send_overlay_message(
+                &TranslatedMessage {
+                    key: "sleep.not_possible".into(),
+                    fallback: None,
+                    args: None,
+                }
+                .component(),
+            );
+        }
+        world.update_sleeping_player_list();
+        Ok(())
+    }
+
+    /// Returns the player's current vanilla respawn configuration.
+    #[must_use]
+    pub fn respawn_config(&self) -> Option<PlayerRespawnConfig> {
+        self.respawn_config.lock().clone()
+    }
+
+    /// Sets the player's vanilla bed or respawn-anchor target.
+    pub fn set_respawn_position(
+        &self,
+        respawn_config: Option<PlayerRespawnConfig>,
+        show_message: bool,
+    ) {
+        let mut current = self.respawn_config.lock();
+        if show_message
+            && respawn_config
+                .as_ref()
+                .is_some_and(|config| !config.is_same_position(current.as_ref()))
+        {
+            self.send_message(
+                &TranslatedMessage {
+                    key: "block.minecraft.set_spawn".into(),
+                    fallback: None,
+                    args: None,
+                }
+                .component(),
+            );
+        }
+        *current = respawn_config;
+    }
+
+    /// Returns how many ticks this player has been sleeping for.
+    #[must_use]
+    pub fn sleep_counter(&self) -> i32 {
+        self.sleep_state.lock().sleep_counter()
+    }
+
+    /// Returns whether this player has slept long enough for vanilla night skip.
+    #[must_use]
+    pub fn is_sleeping_long_enough(&self) -> bool {
+        self.is_sleeping() && self.sleep_counter() >= SLEEP_DURATION
+    }
+
+    fn set_sleep_counter(&self, sleep_counter: i32) {
+        self.sleep_state.lock().set_sleep_counter(sleep_counter);
+    }
+
+    pub(super) fn tick_sleep_counter(&self) {
+        self.sleep_state
+            .lock()
+            .tick_sleep_counter(self.is_sleeping());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glam::DVec3;
+    use steel_utils::{BlockPos, Direction};
+
+    use super::Player;
+
+    #[test]
+    fn sleep_admission_rejects_a_player_outside_vanilla_range() {
+        let bed_pos = BlockPos::new(0, 64, 0);
+        let direction = Direction::South;
+
+        assert!(Player::bed_in_range_from_position(
+            DVec3::new(3.5, 64.0, 0.5),
+            bed_pos,
+            direction,
+        ));
+        assert!(!Player::bed_in_range_from_position(
+            DVec3::new(4.0, 64.0, 0.5),
+            bed_pos,
+            direction,
+        ));
+    }
+
+    #[test]
+    fn sleep_admission_checks_both_bed_halves_for_obstruction() {
+        let bed_pos = BlockPos::new(0, 64, 0);
+        let direction = Direction::South;
+        let above_head = bed_pos.above();
+        let above_foot = direction.opposite().relative(above_head);
+
+        assert!(!Player::bed_blocked_with_free_at(
+            bed_pos,
+            direction,
+            |_| true,
+        ));
+        assert!(Player::bed_blocked_with_free_at(
+            bed_pos,
+            direction,
+            |pos| pos != above_head,
+        ));
+        assert!(Player::bed_blocked_with_free_at(
+            bed_pos,
+            direction,
+            |pos| pos != above_foot,
+        ));
+    }
+}

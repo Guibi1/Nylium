@@ -1,0 +1,2040 @@
+use std::f64::consts::FRAC_1_SQRT_2;
+use std::io::Cursor;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+use super::{
+    ClientInformation, DEATH_DURATION, DROP_SPAM_THROTTLER_INCREMENT_STEP,
+    DROP_SPAM_THROTTLER_THRESHOLD, MenuRemovalStatus, Player, PlayerConnection,
+    PlayerPermissionState, ResetReason,
+    connection::NetworkConnection,
+    experience::Experience,
+    experience::first_point_level_up_sound,
+    game_mode::block_breaking::BlockBreakAction,
+    player_data::{PersistentEnderPearl, PersistentPlayerData, PersistentRootVehicle},
+    player_inventory::MenuItemDisposition,
+    sleep::BedSleepingProblem,
+};
+use crate::behavior::{InteractionResult, init_behaviors};
+use crate::chunk_saver::PersistentEntity;
+use crate::entity::{
+    DEFAULT_MAX_AIR_SUPPLY, Entity, EntitySyncedData, LivingEntity, SharedEntity,
+    damage::DamageSource,
+    entities::{EndermiteEntity, ItemEntity, PigEntity},
+    next_entity_id,
+};
+use crate::inventory::{
+    click::{Click, DragKind, QuickCraft},
+    container::{Container as _, SimpleContainer},
+    equipment::{EntityEquipment, EquipmentSlot},
+    menu::{Menu, MenuBehavior, MenuBuilder, MenuKind, kinds::BasicKind},
+};
+use crate::permission::{PermissionEntry, PermissionKey, PermissionMetadataSet, PermissionSet};
+use crate::player::game_mode::PlayerGameModeState;
+use crate::test_support::{
+    TestPlayerBuilder, fresh_test_world, fresh_test_world_in_domain, hard_damage_test_world,
+    insert_ready_full_chunk, test_world,
+};
+use crate::world::World;
+use glam::DVec3;
+use steel_protocol::packet_traits::{CompressionInfo, EncodedPacket};
+use steel_protocol::packets::common::{
+    ChatVisibility, HumanoidArm, ParticleStatus, SClientInformation,
+};
+use steel_protocol::packets::game::{EquipmentSlotItem, SPlayerInput, SSetCreativeModeSlot};
+use steel_registry::blocks::block_state_ext::BlockStateExt as _;
+use steel_registry::blocks::properties::{BlockStateProperties, Direction};
+use steel_registry::data_component_predicate::DataComponentMatchers;
+use steel_registry::data_components::vanilla_components::{CAN_BREAK, EQUIPPABLE};
+use steel_registry::data_components::{AdventureModePredicate, BlockPredicate};
+use steel_registry::packets::play::{C_REMOVE_ENTITIES, C_SOUND};
+use steel_registry::stat::vanilla_stat_types;
+use steel_registry::{
+    RegistryHolderSet, entity_data::EntityData, init_vanilla_registry, item_stack::ItemStack,
+    sound_events, vanilla_attributes, vanilla_blocks, vanilla_custom_stats, vanilla_damage_types,
+    vanilla_enchantments, vanilla_entities, vanilla_game_rules, vanilla_items, vanilla_menu_types,
+    vanilla_world_clocks,
+};
+use steel_utils::codec::VarInt;
+use steel_utils::locks::{IntoShared as _, SyncMutex};
+use steel_utils::serial::ReadFrom;
+use steel_utils::types::{Difficulty, GameType, InteractionHand, UpdateFlags};
+use steel_utils::{BlockPos, ChunkPos, Downcast as _, DowncastType, DowncastTypeKey, WorldAabb};
+use text_components::TextComponent;
+use uuid::Uuid;
+
+const PLAYER_MAIN_HAND_METADATA_INDEX: u8 = 15;
+const PLAYER_MODEL_CUSTOMIZATION_METADATA_INDEX: u8 = 16;
+const BYTE_ENTITY_DATA_SERIALIZER_ID: i32 = 0;
+const HUMANOID_ARM_ENTITY_DATA_SERIALIZER_ID: i32 = 42;
+
+const MODEL_CUSTOMIZATION_WITH_HIGH_BIT_SET: u8 = 0xff;
+const CAPE_LEFT_SLEEVE_LEFT_PANTS_MASK: u8 = 0b0001_0101;
+const NIGHT_TIME: i64 = 18_000;
+
+#[test]
+fn client_information_initializes_player_cosmetic_metadata() {
+    let world_fixture = fresh_test_world("initial_player_cosmetic_metadata");
+    let world = &world_fixture.world;
+    let player = TestPlayerBuilder::new(Arc::clone(world), "TestPlayer", 1)
+        .uuid(Uuid::from_u128(1))
+        .client_information(ClientInformation {
+            model_customization: MODEL_CUSTOMIZATION_WITH_HIGH_BIT_SET,
+            main_hand: HumanoidArm::Left,
+            ..ClientInformation::default()
+        })
+        .build();
+
+    let values = player.pack_all_entity_data();
+    let Some(main_hand) = values
+        .iter()
+        .find(|value| value.index == PLAYER_MAIN_HAND_METADATA_INDEX)
+    else {
+        panic!("initial metadata should include the non-default main hand");
+    };
+    assert_eq!(
+        main_hand.serializer_id,
+        HUMANOID_ARM_ENTITY_DATA_SERIALIZER_ID
+    );
+    assert!(matches!(
+        main_hand.value,
+        EntityData::HumanoidArm(HumanoidArm::Left)
+    ));
+
+    let Some(model_customization) = values
+        .iter()
+        .find(|value| value.index == PLAYER_MODEL_CUSTOMIZATION_METADATA_INDEX)
+    else {
+        panic!("initial metadata should include the model customization byte");
+    };
+    assert_eq!(
+        model_customization.serializer_id,
+        BYTE_ENTITY_DATA_SERIALIZER_ID
+    );
+    let expected_model_customization = MODEL_CUSTOMIZATION_WITH_HIGH_BIT_SET.cast_signed();
+    assert!(matches!(
+        model_customization.value,
+        EntityData::Byte(value) if value == expected_model_customization
+    ));
+    assert!(player.shows_hat());
+}
+
+#[test]
+fn play_client_information_dirties_changed_cosmetic_metadata_once() {
+    let world_fixture = fresh_test_world("updated_player_cosmetic_metadata");
+    let world = &world_fixture.world;
+    let player = test_player(Arc::clone(world));
+    let _ = player.pack_dirty_entity_data();
+
+    let packet = SClientInformation {
+        language: "en_us".to_owned(),
+        view_distance: 8,
+        chat_visibility: ChatVisibility::Full,
+        chat_colors: true,
+        model_customization: CAPE_LEFT_SLEEVE_LEFT_PANTS_MASK,
+        main_hand: HumanoidArm::Left,
+        text_filtering_enabled: false,
+        allows_listing: true,
+        particle_status: ParticleStatus::All,
+    };
+    player.handle_client_information(packet.clone());
+
+    let Some(values) = player.pack_dirty_entity_data() else {
+        panic!("changed client information should dirty player metadata");
+    };
+    assert_eq!(values.len(), 2);
+
+    let Some(main_hand) = values
+        .iter()
+        .find(|value| value.index == PLAYER_MAIN_HAND_METADATA_INDEX)
+    else {
+        panic!("changed metadata should include the main hand");
+    };
+    assert_eq!(
+        main_hand.serializer_id,
+        HUMANOID_ARM_ENTITY_DATA_SERIALIZER_ID
+    );
+    assert!(matches!(
+        main_hand.value,
+        EntityData::HumanoidArm(HumanoidArm::Left)
+    ));
+
+    let Some(model_customization) = values
+        .iter()
+        .find(|value| value.index == PLAYER_MODEL_CUSTOMIZATION_METADATA_INDEX)
+    else {
+        panic!("changed metadata should include model customization");
+    };
+    assert_eq!(
+        model_customization.serializer_id,
+        BYTE_ENTITY_DATA_SERIALIZER_ID
+    );
+    let expected_model_customization = CAPE_LEFT_SLEEVE_LEFT_PANTS_MASK.cast_signed();
+    assert!(matches!(
+        model_customization.value,
+        EntityData::Byte(value) if value == expected_model_customization
+    ));
+
+    player.handle_client_information(packet);
+    assert!(player.pack_dirty_entity_data().is_none());
+}
+
+struct RecordingConnection {
+    sent_packets: Arc<SyncMutex<Vec<EncodedPacket>>>,
+    closed: AtomicBool,
+}
+
+impl NetworkConnection for RecordingConnection {
+    fn compression(&self) -> Option<CompressionInfo> {
+        None
+    }
+
+    fn send_encoded(&self, packet: EncodedPacket) {
+        self.sent_packets.lock().push(packet);
+    }
+
+    fn send_encoded_bundle(&self, packets: Vec<EncodedPacket>) {
+        self.sent_packets.lock().extend(packets);
+    }
+
+    fn disconnect_with_reason(&self, _reason: TextComponent) {}
+
+    fn tick(&self) {}
+
+    fn latency(&self) -> i32 {
+        0
+    }
+
+    fn close(&self) {
+        self.closed.store(true, Ordering::Release);
+    }
+
+    fn closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+}
+
+fn removed_entity_ids(packet: &EncodedPacket) -> Vec<i32> {
+    let mut cursor = Cursor::new(packet.encoded_data.as_slice());
+    let Ok(_) = VarInt::read(&mut cursor) else {
+        return Vec::new();
+    };
+    let Ok(packet_id) = VarInt::read(&mut cursor) else {
+        return Vec::new();
+    };
+    if packet_id.0 != C_REMOVE_ENTITIES {
+        return Vec::new();
+    }
+    let Ok(entity_count) = VarInt::read(&mut cursor) else {
+        return Vec::new();
+    };
+
+    let mut entity_ids = Vec::new();
+    for _ in 0..entity_count.0 {
+        let Ok(entity_id) = VarInt::read(&mut cursor) else {
+            return Vec::new();
+        };
+        entity_ids.push(entity_id.0);
+    }
+    entity_ids
+}
+
+fn sound_packet_ids(packets: &[EncodedPacket]) -> Vec<i32> {
+    packets
+        .iter()
+        .filter_map(|packet| {
+            let mut cursor = Cursor::new(packet.encoded_data.as_slice());
+            VarInt::read(&mut cursor).ok()?;
+            if VarInt::read(&mut cursor).ok()?.0 != C_SOUND {
+                return None;
+            }
+            Some(VarInt::read(&mut cursor).ok()?.0)
+        })
+        .collect()
+}
+
+fn test_player(world: Arc<World>) -> Arc<Player> {
+    let player = TestPlayerBuilder::new(world, "TestPlayer", 1).build();
+    player.set_client_loaded(true);
+    player
+}
+
+#[test]
+fn last_client_move_intent_matches_vanilla_directional_inputs() {
+    const FORWARD: u8 = 0x01;
+    const BACKWARD: u8 = 0x02;
+    const LEFT: u8 = 0x04;
+    const RIGHT: u8 = 0x08;
+    const JUMP: u8 = 0x10;
+    const SHIFT: u8 = 0x20;
+    const SPRINT: u8 = 0x40;
+
+    let player = test_player(Arc::clone(test_world()));
+    let diagonal = FRAC_1_SQRT_2;
+
+    let cases = [
+        ("no input", 0, 0.0, DVec3::ZERO),
+        ("forward", FORWARD, 0.0, DVec3::new(0.0, 0.0, 1.0)),
+        ("backward", BACKWARD, 0.0, DVec3::new(0.0, 0.0, -1.0)),
+        ("left", LEFT, 0.0, DVec3::new(1.0, 0.0, 0.0)),
+        ("right", RIGHT, 0.0, DVec3::new(-1.0, 0.0, 0.0)),
+        (
+            "opposite forward inputs",
+            FORWARD | BACKWARD,
+            0.0,
+            DVec3::ZERO,
+        ),
+        ("opposite sideways inputs", LEFT | RIGHT, 0.0, DVec3::ZERO),
+        (
+            "forward-right diagonal",
+            FORWARD | RIGHT,
+            0.0,
+            DVec3::new(-diagonal, 0.0, diagonal),
+        ),
+        (
+            "forward rotated by yaw",
+            FORWARD,
+            90.0,
+            DVec3::new(-1.0, 0.0, 0.0),
+        ),
+        (
+            "non-movement inputs",
+            JUMP | SHIFT | SPRINT,
+            0.0,
+            DVec3::ZERO,
+        ),
+    ];
+
+    for (name, flags, yaw, expected) in cases {
+        player.set_rotation((yaw, 0.0));
+        player.handle_player_input(SPlayerInput { flags });
+
+        let actual = player.last_client_move_intent();
+
+        assert!(
+            (actual - expected).length_squared() < 1.0E-12,
+            "{name}: expected {expected:?}, got {actual:?}"
+        );
+    }
+}
+
+fn test_persistent_entity(
+    entity_type: steel_utils::Identifier,
+    uuid: [u8; 16],
+) -> PersistentEntity {
+    PersistentEntity {
+        entity_type,
+        uuid,
+        pos: [4.0, 65.0, 6.0],
+        motion: [0.0, 0.0, 0.0],
+        rotation: [0.0, 0.0],
+        fall_distance: 0.0,
+        remaining_fire_ticks: 0,
+        ticks_frozen: 0,
+        is_in_powder_snow: false,
+        was_in_powder_snow: false,
+        has_visual_fire: false,
+        on_ground: true,
+        no_gravity: false,
+        invulnerable: false,
+        air_supply: DEFAULT_MAX_AIR_SUPPLY,
+        portal_cooldown: 0,
+        custom_name_nbt: Vec::new(),
+        custom_name_visible: false,
+        silent: false,
+        glowing: false,
+        tags: Vec::new(),
+        custom_data_nbt: Vec::new(),
+        nbt_data: Vec::new(),
+        passengers: Vec::new(),
+    }
+}
+
+#[test]
+fn advancing_domain_residence_invalidates_stale_restore_owners() {
+    let source_world_fixture = fresh_test_world_in_domain("source", "spawn");
+    let source_world = &source_world_fixture.world;
+    let target_world_fixture = fresh_test_world_in_domain("target", "spawn");
+    let target_world = &target_world_fixture.world;
+    let player = test_player(Arc::clone(source_world));
+    let source_token = player.domain_residence_token();
+    let root_uuid = [2; 16];
+    let pearl_uuid = [3; 16];
+    let source_root = PersistentRootVehicle {
+        attach: [4; 16],
+        entity: test_persistent_entity(vanilla_entities::MINECART.key.clone(), root_uuid),
+    };
+    let source_pearl = PersistentEnderPearl {
+        world: source_world.key.to_string(),
+        entity: test_persistent_entity(vanilla_entities::ENDER_PEARL.key.clone(), pearl_uuid),
+    };
+
+    assert!(player.install_pending_domain_restores(
+        source_token,
+        source_world,
+        Some(source_root.clone()),
+        vec![source_pearl.clone()],
+    ));
+
+    let target_token = player.advance_domain_residence();
+    assert_ne!(source_token, target_token);
+    assert!(!player.is_domain_residence_current(source_token));
+    assert!(player.pending_root_vehicle_for_current_world().is_none());
+    assert!(player.pending_ender_pearls().is_empty());
+    assert!(
+        !player.install_pending_domain_restores(
+            source_token,
+            source_world,
+            Some(source_root),
+            vec![source_pearl],
+        ),
+        "a delayed source job must not repopulate a later residence"
+    );
+
+    let target_pearl_uuid = [5; 16];
+    let target_pearl = PersistentEnderPearl {
+        world: target_world.key.to_string(),
+        entity: test_persistent_entity(
+            vanilla_entities::ENDER_PEARL.key.clone(),
+            target_pearl_uuid,
+        ),
+    };
+    assert!(player.install_pending_domain_restores(
+        target_token,
+        target_world,
+        None,
+        vec![target_pearl],
+    ));
+    assert!(!player.discard_pending_ender_pearl(source_token, Uuid::from_bytes(target_pearl_uuid)));
+    assert!(
+        player
+            .take_matching_pending_ender_pearl(
+                target_token,
+                source_world,
+                Uuid::from_bytes(target_pearl_uuid),
+            )
+            .is_none(),
+        "a restore job must claim its payload from the expected world"
+    );
+    assert!(
+        player
+            .take_matching_pending_ender_pearl(
+                target_token,
+                target_world,
+                Uuid::from_bytes(target_pearl_uuid),
+            )
+            .is_some()
+    );
+}
+
+macro_rules! impl_test_menu_kind_downcast {
+    ($type:ty, $key:literal) => {
+        // SAFETY: This test-owned key uniquely identifies the concrete menu
+        // kind within the test process.
+        unsafe impl DowncastType for $type {
+            const TYPE_KEY: DowncastTypeKey = DowncastTypeKey::new($key);
+        }
+    };
+}
+
+struct CountRemovals {
+    count: Arc<AtomicUsize>,
+}
+
+impl_test_menu_kind_downcast!(CountRemovals, "steel:test/menu/player/count_removals");
+
+impl MenuKind for CountRemovals {
+    fn removed(&mut self, _behavior: &mut MenuBehavior, _player: &Player) {
+        self.count.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+struct ReopenOnRemoved {
+    replacement_removals: Arc<AtomicUsize>,
+}
+
+impl_test_menu_kind_downcast!(ReopenOnRemoved, "steel:test/menu/player/reopen_on_removed");
+
+impl MenuKind for ReopenOnRemoved {
+    fn removed(&mut self, _behavior: &mut MenuBehavior, player: &Player) {
+        let replacement_removals = Arc::clone(&self.replacement_removals);
+        player.open_menu("Replacement", move |context| {
+            empty_test_menu(
+                context.player,
+                context.container_id,
+                CountRemovals {
+                    count: replacement_removals,
+                },
+            )
+        });
+    }
+}
+
+fn empty_test_menu(player: &Player, container_id: u8, kind: impl MenuKind + 'static) -> Menu {
+    let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X1, container_id);
+    builder.section(SimpleContainer::new(9).into_shared(), 9);
+    builder.player_inventory(&player.inventory);
+    builder.build(kind)
+}
+
+fn permission_key(value: &str) -> PermissionKey {
+    match PermissionKey::parse(value) {
+        Ok(key) => key,
+        Err(error) => panic!("test permission key should parse: {error}"),
+    }
+}
+
+#[test]
+fn permission_state_replacement_is_versioned_and_keeps_both_rule_sets() {
+    let mut state = PlayerPermissionState::default();
+    let overrides =
+        PermissionSet::from_entries([PermissionEntry::deny(permission_key("steel.fly"))]);
+    let effective =
+        PermissionSet::from_entries([PermissionEntry::allow(permission_key("steel.build"))]);
+
+    let first = state.replace(
+        vec!["builder".to_owned()],
+        overrides.clone(),
+        PermissionMetadataSet::new(),
+        effective.clone(),
+        PermissionMetadataSet::new(),
+    );
+    let second = state.replace(
+        vec!["moderator".to_owned()],
+        overrides,
+        PermissionMetadataSet::new(),
+        effective,
+        PermissionMetadataSet::new(),
+    );
+
+    assert_eq!(first, 1);
+    assert_eq!(second, 2);
+    assert_eq!(state.groups, ["moderator"]);
+    assert!(!state.overrides.allows_key(&permission_key("steel.fly")));
+    assert!(state.effective.allows_key(&permission_key("steel.build")));
+}
+
+#[test]
+fn respawn_request_is_allowed_after_dead_reconnect() {
+    assert!(Player::should_process_respawn(0.0));
+}
+
+#[test]
+fn ai_step_copies_player_yaw_to_head_yaw() {
+    init_vanilla_registry();
+    init_behaviors();
+    let player = test_player(Arc::clone(test_world()));
+    let player_entity: SharedEntity = Arc::<Player>::clone(&player);
+    player.set_rotation((90.0, 15.0));
+    player.set_y_head_rot(-45.0);
+
+    let _ = player.ai_step(&player_entity);
+
+    assert_eq!(player.y_head_rot().to_bits(), 90.0_f32.to_bits());
+}
+
+#[test]
+fn respawn_request_is_ignored_while_alive() {
+    assert!(!Player::should_process_respawn(20.0));
+}
+
+#[test]
+fn respawn_request_uses_health_not_death_processed_guard() {
+    struct RespawnGateInput {
+        health: f32,
+        death_processed: bool,
+    }
+
+    let input = RespawnGateInput {
+        health: 20.0,
+        death_processed: true,
+    };
+
+    assert!(input.death_processed);
+    assert!(!Player::should_process_respawn(input.health));
+}
+
+#[test]
+fn end_credits_respawn_keeps_vanilla_attribute_data_only() {
+    assert_eq!(ResetReason::InitialJoin.respawn_data_kept(), 0x00);
+    assert_eq!(ResetReason::Respawn.respawn_data_kept(), 0x00);
+    assert_eq!(ResetReason::EndCredits.respawn_data_kept(), 0x01);
+    assert_eq!(ResetReason::WorldChange.respawn_data_kept(), 0x03);
+}
+
+#[test]
+#[expect(
+    clippy::too_many_lines,
+    reason = "the full death-to-removal flow must verify every menu item disposition together"
+)]
+fn death_keeps_menu_items_until_entity_removal() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("death_menu_cleanup");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    assert!(world.set_game_rule(&vanilla_game_rules::KEEP_INVENTORY, true));
+    let player = test_player(Arc::clone(world));
+    let kept_item = ItemStack::new(&vanilla_items::DIAMOND);
+    player.inventory.lock().set_item(0, kept_item);
+    let transient = SimpleContainer::new(9).into_shared();
+    transient
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 3));
+    let crafting = player.crafting_container();
+    crafting
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::DIRT, 2));
+    *player.inventory_menu.lock().behavior_mut().carried_mut() =
+        ItemStack::new(&vanilla_items::STICK);
+    player.inventory_menu.lock().clicked(
+        Click::QuickCraft(QuickCraft::Start {
+            kind: DragKind::Left,
+        }),
+        &player,
+    );
+    assert_eq!(
+        player.inventory_menu.lock().behavior().quickcraft(),
+        Some(DragKind::Left)
+    );
+
+    let menu_container = Arc::clone(&transient);
+    let inventory = Arc::clone(&player.inventory);
+    player.open_menu("Death cleanup", move |context| {
+        let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X1, context.container_id);
+        let transient_slots = builder.section(menu_container, 9);
+        builder.player_inventory(&inventory);
+        builder.drain([transient_slots]);
+        builder.build(BasicKind {})
+    });
+
+    player.set_health(0.0);
+    player.die(&DamageSource::environment(&vanilla_damage_types::GENERIC));
+
+    assert_eq!(transient.lock().get_item(0).count(), 3);
+    assert_eq!(crafting.lock().get_item(0).count(), 2);
+    assert!(
+        player
+            .inventory_menu
+            .lock()
+            .behavior()
+            .carried()
+            .is(&vanilla_items::STICK)
+    );
+    assert!(
+        world
+            .get_entities_in_aabb_matching(
+                &WorldAabb::new(-2.0, -1.0, -2.0, 2.0, 3.0, 2.0),
+                |entity| entity.entity_type() == &vanilla_entities::ITEM,
+            )
+            .is_empty()
+    );
+
+    for _ in 1..DEATH_DURATION {
+        player.tick_death();
+    }
+    assert_eq!(transient.lock().get_item(0).count(), 3);
+
+    player.tick_death();
+
+    assert!(transient.lock().get_item(0).is_empty());
+    assert!(crafting.lock().get_item(0).is_empty());
+    assert!(player.inventory_menu.lock().behavior().carried().is_empty());
+    assert_eq!(
+        player.inventory_menu.lock().behavior().quickcraft(),
+        Some(DragKind::Left)
+    );
+    assert!(
+        player
+            .inventory
+            .lock()
+            .get_item(0)
+            .is(&vanilla_items::DIAMOND)
+    );
+    let dropped = world.get_entities_in_aabb_matching(
+        &WorldAabb::new(-2.0, -1.0, -2.0, 2.0, 3.0, 2.0),
+        |entity| entity.entity_type() == &vanilla_entities::ITEM,
+    );
+    assert_eq!(dropped.len(), 3);
+    let mut dropped_stacks = Vec::new();
+    for entity in dropped {
+        let Some(item) = entity.as_ref().downcast_ref::<ItemEntity>() else {
+            panic!("dropped entity should retain its concrete item type");
+        };
+        dropped_stacks.push(item.get_item());
+    }
+    assert!(
+        dropped_stacks
+            .iter()
+            .any(|item| item.is(&vanilla_items::STONE) && item.count() == 3)
+    );
+    assert!(
+        dropped_stacks
+            .iter()
+            .any(|item| item.is(&vanilla_items::DIRT) && item.count() == 2)
+    );
+    assert!(
+        dropped_stacks
+            .iter()
+            .any(|item| item.is(&vanilla_items::STICK) && item.count() == 1)
+    );
+}
+
+#[test]
+fn death_removes_tracked_entities_from_dead_players_client() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("death_entity_pairing_cleanup");
+    let world = &world_fixture.world;
+    let sent_packets = Arc::new(SyncMutex::new(Vec::new()));
+    let connection = Arc::new(PlayerConnection::Other(Box::new(RecordingConnection {
+        sent_packets: Arc::clone(&sent_packets),
+        closed: AtomicBool::new(false),
+    })));
+    let player = TestPlayerBuilder::new(Arc::clone(world), "TestPlayer", 1)
+        .connection(connection)
+        .build();
+    let item: SharedEntity = Arc::new(ItemEntity::new(
+        &vanilla_entities::ITEM,
+        2,
+        DVec3::ZERO,
+        Arc::downgrade(world),
+    ));
+
+    world.entity_tracker().add(
+        &item,
+        |_| vec![player.id()],
+        |player_id| (player_id == player.id()).then(|| Arc::clone(&player)),
+    );
+    assert_eq!(
+        world.entity_tracker().tracking_player_ids(item.id()),
+        vec![player.id()]
+    );
+    sent_packets.lock().clear();
+
+    for _ in 0..DEATH_DURATION {
+        player.tick_death();
+    }
+
+    let removed_ids = sent_packets
+        .lock()
+        .iter()
+        .flat_map(removed_entity_ids)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        removed_ids,
+        vec![item.id()],
+        "vanilla removes every entity pairing from a dead player's client"
+    );
+    assert_eq!(
+        world.entity_tracker().tracking_player_ids(item.id()).len(),
+        0
+    );
+}
+
+#[test]
+fn death_respawn_cleanup_drops_menu_items_before_fresh_player_construction() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("death_respawn_menu_cleanup");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+    let transient = SimpleContainer::new(9).into_shared();
+    transient
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 3));
+    {
+        let mut inventory_menu = player.inventory_menu.lock();
+        *inventory_menu.behavior_mut().carried_mut() = ItemStack::new(&vanilla_items::STICK);
+        inventory_menu.clicked(
+            Click::QuickCraft(QuickCraft::Start {
+                kind: DragKind::Left,
+            }),
+            &player,
+        );
+        *inventory_menu.behavior_mut().carried_mut() = ItemStack::empty();
+    }
+
+    let menu_container = Arc::clone(&transient);
+    let inventory = Arc::clone(&player.inventory);
+    player.open_menu("Respawn cleanup", move |context| {
+        let mut builder = MenuBuilder::new(&vanilla_menu_types::GENERIC_9X1, context.container_id);
+        let transient_slots = builder.section(menu_container, 9);
+        builder.player_inventory(&inventory);
+        builder.drain([transient_slots]);
+        builder.build(BasicKind {})
+    });
+
+    player.set_health(0.0);
+    player.die(&DamageSource::environment(&vanilla_damage_types::GENERIC));
+    assert_eq!(
+        player.remove_all_menus_with_disposition(MenuItemDisposition::Drop),
+        MenuRemovalStatus::Complete
+    );
+    let replacement = player.new_respawn_replacement(Arc::clone(world), false, false, true);
+    {
+        let mut inventory_menu = replacement.inventory_menu.lock();
+        assert_eq!(inventory_menu.behavior().quickcraft(), None);
+        *inventory_menu.behavior_mut().carried_mut() = ItemStack::new(&vanilla_items::STICK);
+        inventory_menu.clicked(
+            Click::QuickCraft(QuickCraft::Start {
+                kind: DragKind::Left,
+            }),
+            &replacement,
+        );
+        assert_eq!(inventory_menu.behavior().quickcraft(), Some(DragKind::Left));
+    }
+
+    assert!(transient.lock().get_item(0).is_empty());
+    assert!(
+        player
+            .inventory
+            .lock()
+            .items()
+            .iter()
+            .all(|item| !item.is(&vanilla_items::STONE))
+    );
+    let dropped = world.get_entities_in_aabb_matching(
+        &WorldAabb::new(-2.0, -1.0, -2.0, 2.0, 3.0, 2.0),
+        |entity| entity.entity_type() == &vanilla_entities::ITEM,
+    );
+    assert_eq!(dropped.len(), 1);
+    let Some(item) = dropped[0].as_ref().downcast_ref::<ItemEntity>() else {
+        panic!("dropped entity should retain its concrete item type");
+    };
+    assert_eq!(item.get_item().count(), 3);
+}
+
+#[test]
+fn end_credits_removes_all_menus_before_detaching() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("end_credits_menu_removal");
+    let world = &world_fixture.world;
+    let player = test_player(Arc::clone(world));
+    assert!(world.add_player(Arc::clone(&player), ResetReason::InitialJoin));
+    let _ = player.mark_joined_world();
+
+    player
+        .crafting_container()
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 2));
+    *player.inventory_menu.lock().behavior_mut().carried_mut() =
+        ItemStack::with_count(&vanilla_items::DIRT, 3);
+    let replacement_removals = Arc::new(AtomicUsize::new(0));
+    let factory_replacement_removals = Arc::clone(&replacement_removals);
+    player.open_menu("Reopen on removal", move |context| {
+        empty_test_menu(
+            context.player,
+            context.container_id,
+            ReopenOnRemoved {
+                replacement_removals: factory_replacement_removals,
+            },
+        )
+    });
+
+    player.show_end_credits();
+
+    assert!(player.has_won_game());
+    assert!(!player.has_container_open());
+    assert!(
+        world
+            .players
+            .get_by_uuid(&player.gameprofile.id())
+            .is_none()
+    );
+    assert_eq!(replacement_removals.load(Ordering::Relaxed), 0);
+    let inventory = player.inventory.lock();
+    for (item, expected) in [(&vanilla_items::STONE, 2), (&vanilla_items::DIRT, 3)] {
+        let count: i32 = inventory
+            .items()
+            .iter()
+            .filter(|stack| stack.is(item))
+            .map(ItemStack::count)
+            .sum();
+        assert_eq!(count, expected);
+    }
+}
+
+#[test]
+fn admitted_world_change_prevents_end_credits_detach() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("end_credits_pending_world_change");
+    let world = &world_fixture.world;
+    let player = test_player(Arc::clone(world));
+    assert!(world.add_player(Arc::clone(&player), ResetReason::InitialJoin));
+    let _ = player.mark_joined_world();
+    let Some(pending_token) = player.begin_pending_world_change() else {
+        panic!("test player should accept a pending world change");
+    };
+
+    player.show_end_credits();
+
+    assert!(!player.has_won_game());
+    assert!(world.contains_player(&player));
+    assert!(player.finish_pending_world_change(pending_token));
+
+    player.show_end_credits();
+
+    assert!(player.has_won_game());
+    assert!(!world.contains_player(&player));
+}
+
+#[test]
+fn duplicate_exact_player_admission_cleans_existing_membership() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("duplicate_player_admission");
+    let world = &world_fixture.world;
+    let player = test_player(Arc::clone(world));
+    assert!(world.add_player(Arc::clone(&player), ResetReason::InitialJoin));
+
+    assert!(!world.add_player(Arc::clone(&player), ResetReason::WorldChange));
+
+    assert!(!world.contains_player(&player));
+    assert!(world.get_entity_by_id(player.id()).is_none());
+}
+
+#[test]
+fn disabled_damage_game_rule_matches_vanilla_player_damage_gates() {
+    init_vanilla_registry();
+
+    let cases = [
+        (
+            &vanilla_damage_types::DROWN,
+            &vanilla_game_rules::DROWNING_DAMAGE,
+        ),
+        (
+            &vanilla_damage_types::FALL,
+            &vanilla_game_rules::FALL_DAMAGE,
+        ),
+        (
+            &vanilla_damage_types::LAVA,
+            &vanilla_game_rules::FIRE_DAMAGE,
+        ),
+        (
+            &vanilla_damage_types::FREEZE,
+            &vanilla_game_rules::FREEZE_DAMAGE,
+        ),
+    ];
+
+    for (damage_type, rule) in cases {
+        let source = DamageSource::environment(damage_type);
+        let mapped = Player::disabled_damage_game_rule(&source);
+        assert!(mapped.is_some_and(|mapped| mapped.key() == rule.key()));
+    }
+}
+
+#[test]
+fn disabled_damage_game_rule_ignores_unrelated_damage() {
+    init_vanilla_registry();
+    let source = DamageSource::environment(&vanilla_damage_types::GENERIC);
+
+    assert!(Player::disabled_damage_game_rule(&source).is_none());
+}
+
+#[test]
+fn hurt_uses_explicit_world_difficulty() {
+    let attached_world = Arc::clone(test_world());
+    let damage_world = hard_damage_test_world();
+    let player = test_player(attached_world);
+    let source = DamageSource::environment(&vanilla_damage_types::EXPLOSION);
+
+    assert_eq!(player.get_world().difficulty(), Difficulty::Normal);
+    assert_eq!(damage_world.difficulty(), Difficulty::Hard);
+    assert_eq!(player.get_health().to_bits(), 20.0_f32.to_bits());
+
+    assert!(player.hurt(damage_world, &source, 4.0));
+    assert_eq!(player.get_health().to_bits(), 14.0_f32.to_bits());
+}
+
+#[test]
+fn conditional_damage_does_not_scale_without_a_living_non_player_cause() {
+    let world = hard_damage_test_world();
+    let causing_player: SharedEntity = test_player(Arc::clone(world));
+    let object: SharedEntity = Arc::new(ItemEntity::new(
+        &vanilla_entities::ITEM,
+        2,
+        DVec3::ZERO,
+        Arc::downgrade(world),
+    ));
+    for cause in [None, Some(causing_player), Some(object)] {
+        let mut source = DamageSource::environment(&vanilla_damage_types::FIREWORKS);
+        if let Some(cause) = cause {
+            source = source.with_causing_entity(cause);
+        }
+        let target = test_player(Arc::clone(world));
+        assert!(target.hurt(world, &source, 4.0));
+        assert_eq!(target.get_health().to_bits(), 16.0_f32.to_bits());
+    }
+}
+
+#[test]
+fn player_damage_applies_armor_and_absorption() {
+    init_vanilla_registry();
+    let world = Arc::clone(test_world());
+    let player = test_player(Arc::clone(&world));
+    {
+        let mut attributes = player.attributes().lock();
+        attributes.set_base_value(vanilla_attributes::ARMOR, 20.0);
+        attributes.set_base_value(vanilla_attributes::MAX_ABSORPTION, 3.0);
+    }
+    player.set_absorption_amount(3.0);
+    let source = DamageSource::environment(&vanilla_damage_types::FIREWORKS);
+
+    assert!(player.hurt(&world, &source, 10.0));
+
+    assert_eq!(player.get_health().to_bits(), 19.0_f32.to_bits());
+    assert_eq!(player.get_absorption_amount().to_bits(), 0.0_f32.to_bits());
+}
+
+#[test]
+fn player_absorption_amount_clamps_to_attribute_range() {
+    let world = Arc::clone(test_world());
+    let player = test_player(world);
+    player
+        .attributes()
+        .lock()
+        .set_base_value(vanilla_attributes::MAX_ABSORPTION, 4.0);
+
+    player.set_absorption_amount(10.0);
+    assert_eq!(player.get_absorption_amount().to_bits(), 4.0_f32.to_bits());
+
+    player.set_absorption_amount(-1.0);
+    assert_eq!(player.get_absorption_amount().to_bits(), 0.0_f32.to_bits());
+}
+
+#[test]
+fn player_damage_hurts_armor_equipment() {
+    init_vanilla_registry();
+    let world = Arc::clone(test_world());
+    let player = test_player(Arc::clone(&world));
+    player.inventory.lock().set(
+        EquipmentSlot::Chest,
+        ItemStack::new(&vanilla_items::DIAMOND_CHESTPLATE),
+    );
+    let source = DamageSource::environment(&vanilla_damage_types::FIREWORKS);
+
+    assert!(player.hurt(&world, &source, 8.0));
+
+    let inventory = player.inventory.lock();
+    assert_eq!(
+        inventory.get_ref(EquipmentSlot::Chest).get_damage_value(),
+        2,
+    );
+}
+
+#[test]
+fn player_attack_applies_thorns_damage_and_breaks_enchanted_armor() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("player_attack_thorns");
+    let world = &world_fixture.world;
+    let attacker = test_player(Arc::clone(world));
+    let victim = TestPlayerBuilder::new(Arc::clone(world), "Victim", 2).build();
+    victim.set_client_loaded(true);
+    {
+        let mut inventory = attacker.inventory.lock();
+        inventory.set_selected_item(ItemStack::new(&vanilla_items::DIAMOND_SWORD));
+        let mut helmet = ItemStack::new(&vanilla_items::DIAMOND_HELMET);
+        helmet.set_enchantments(&[(vanilla_enchantments::THORNS.key.clone(), 7)], false);
+        helmet.set_damage_value(helmet.get_max_damage() - 1);
+        inventory.set(EquipmentSlot::Head, helmet);
+    }
+    let mut chestplate = ItemStack::new(&vanilla_items::DIAMOND_CHESTPLATE);
+    // Vanilla's 15% chance per level makes level 7 activate on every attack.
+    chestplate.set_enchantments(&[(vanilla_enchantments::THORNS.key.clone(), 7)], false);
+    // Leave one durability for the incoming hit and two for the Thorns effect.
+    chestplate.set_damage_value(chestplate.get_max_damage() - 3);
+    victim
+        .inventory
+        .lock()
+        .set(EquipmentSlot::Chest, chestplate);
+    LivingEntity::detect_equipment_updates(attacker.as_ref());
+    LivingEntity::detect_equipment_updates(victim.as_ref());
+    let attacker_health = attacker.get_health();
+    let victim_health = victim.get_health();
+    let target: SharedEntity = Arc::<Player>::clone(&victim);
+
+    assert!(attacker.attack(&target));
+
+    assert!(victim.get_health() < victim_health);
+    assert!(attacker.get_health() < attacker_health);
+    let retaliation = attacker.last_damage_source().expect("Thorns retaliation");
+    assert_eq!(retaliation.damage_type, &vanilla_damage_types::THORNS);
+    assert!(Arc::ptr_eq(
+        retaliation.causing_entity().expect("Thorns owner"),
+        &target,
+    ));
+    assert!(
+        attacker
+            .inventory
+            .lock()
+            .get_ref(EquipmentSlot::Head)
+            .is_empty()
+    );
+    assert_eq!(
+        victim
+            .last_damage_source()
+            .expect("original attack")
+            .damage_type,
+        &vanilla_damage_types::PLAYER_ATTACK,
+        "Thorns damage does not initiate another post-attack enchantment pass",
+    );
+    assert!(
+        victim
+            .inventory
+            .lock()
+            .get_ref(EquipmentSlot::Chest)
+            .is_empty()
+    );
+    assert_eq!(
+        victim
+            .stats
+            .lock()
+            .get(&vanilla_stat_types::ITEM_BROKEN.get(&vanilla_items::DIAMOND_CHESTPLATE)),
+        1,
+    );
+}
+
+#[test]
+fn equipping_player_target_uses_inventory_equipment_storage() {
+    init_vanilla_registry();
+    let world = Arc::clone(test_world());
+    let source = test_player(Arc::clone(&world));
+    let target = TestPlayerBuilder::new(world, "Target", next_entity_id()).build();
+    let mut helmet = ItemStack::new(&vanilla_items::DIAMOND_HELMET);
+    let Some(mut equippable) = helmet.get_equippable().cloned() else {
+        panic!("diamond helmet should have equippable data");
+    };
+    equippable.equip_on_interact = true;
+    helmet.set(EQUIPPABLE, equippable);
+    source.inventory.lock().set_selected_item(helmet.clone());
+
+    let result = LivingEntity::interact_living_entity_with_equippable(
+        target.as_ref(),
+        source.as_ref(),
+        InteractionHand::MainHand,
+    );
+
+    assert_eq!(result, InteractionResult::Success);
+    assert!(source.inventory.lock().get_selected_item().is_empty());
+    assert_eq!(
+        target.inventory.lock().get_ref(EquipmentSlot::Head),
+        &helmet
+    );
+    assert_eq!(
+        target
+            .living_base()
+            .equipment()
+            .lock()
+            .get_ref(EquipmentSlot::Head),
+        &helmet,
+        "LivingEntityBase and Player::inventory must share one equipment backing",
+    );
+    LivingEntity::detect_equipment_updates(target.as_ref());
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(target.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::Head,
+            item_stack: helmet,
+        }]
+    );
+}
+
+#[test]
+fn living_tick_detects_raw_inventory_equipment_mutation() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    let (base_armor, base_toughness) = {
+        let attributes = player.attributes().lock();
+        (
+            attributes.required_value(vanilla_attributes::ARMOR),
+            attributes.required_value(vanilla_attributes::ARMOR_TOUGHNESS),
+        )
+    };
+
+    {
+        let mut inventory = player.inventory.lock();
+        inventory.items_mut()[39] = ItemStack::new(&vanilla_items::DIAMOND_HELMET);
+    }
+
+    LivingEntity::detect_equipment_updates(player.as_ref());
+
+    {
+        let attributes = player.attributes().lock();
+        assert_eq!(
+            attributes
+                .required_value(vanilla_attributes::ARMOR)
+                .to_bits(),
+            (base_armor + 3.0).to_bits()
+        );
+        assert_eq!(
+            attributes
+                .required_value(vanilla_attributes::ARMOR_TOUGHNESS)
+                .to_bits(),
+            (base_toughness + 2.0).to_bits()
+        );
+    }
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::Head,
+            item_stack: ItemStack::new(&vanilla_items::DIAMOND_HELMET),
+        }]
+    );
+    LivingEntity::detect_equipment_updates(player.as_ref());
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()).len(),
+        0
+    );
+}
+
+#[test]
+fn fresh_death_respawn_redetects_unchanged_kept_equipment() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    let (base_armor, base_toughness) = {
+        let attributes = player.attributes().lock();
+        (
+            attributes.required_value(vanilla_attributes::ARMOR),
+            attributes.required_value(vanilla_attributes::ARMOR_TOUGHNESS),
+        )
+    };
+    let helmet = ItemStack::new(&vanilla_items::DIAMOND_HELMET);
+    player
+        .inventory
+        .lock()
+        .set(EquipmentSlot::Head, helmet.clone());
+
+    LivingEntity::detect_equipment_updates(player.as_ref());
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::Head,
+            item_stack: helmet.clone(),
+        }]
+    );
+
+    // Both keep-inventory and spectator respawns retain the stack, while the
+    // replacement starts with fresh transient attributes and equipment caches.
+    let replacement = player.new_respawn_replacement(Arc::clone(test_world()), false, true, true);
+    assert_eq!(
+        replacement
+            .attributes()
+            .lock()
+            .required_value(vanilla_attributes::ARMOR)
+            .to_bits(),
+        base_armor.to_bits()
+    );
+    assert!(ItemStack::matches(
+        replacement.inventory.lock().get_ref(EquipmentSlot::Head),
+        &helmet
+    ));
+
+    LivingEntity::detect_equipment_updates(replacement.as_ref());
+    {
+        let attributes = replacement.attributes().lock();
+        assert_eq!(
+            attributes
+                .required_value(vanilla_attributes::ARMOR)
+                .to_bits(),
+            (base_armor + 3.0).to_bits()
+        );
+        assert_eq!(
+            attributes
+                .required_value(vanilla_attributes::ARMOR_TOUGHNESS)
+                .to_bits(),
+            (base_toughness + 2.0).to_bits()
+        );
+    }
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(replacement.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::Head,
+            item_stack: helmet,
+        }]
+    );
+
+    LivingEntity::detect_equipment_updates(replacement.as_ref());
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(replacement.as_ref()).len(),
+        0
+    );
+}
+
+#[test]
+fn fresh_death_respawn_discards_stale_pending_equipment_change() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    player.inventory.lock().set(
+        EquipmentSlot::Head,
+        ItemStack::new(&vanilla_items::DIAMOND_HELMET),
+    );
+    LivingEntity::detect_equipment_updates(player.as_ref());
+
+    player
+        .inventory
+        .lock()
+        .set(EquipmentSlot::Head, ItemStack::empty());
+    let replacement = player.new_respawn_replacement(Arc::clone(test_world()), false, true, true);
+    LivingEntity::detect_equipment_updates(replacement.as_ref());
+
+    assert!(
+        LivingEntity::drain_dirty_equipment(replacement.as_ref()).is_empty(),
+        "respawn must not emit equipment queued by the removed living entity"
+    );
+}
+
+#[test]
+fn equipment_detection_tracks_selected_main_hand() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    {
+        let mut inventory = player.inventory.lock();
+        inventory.set_item(0, ItemStack::new(&vanilla_items::STICK));
+        inventory.set_item(1, ItemStack::new(&vanilla_items::OAK_LOG));
+    }
+
+    LivingEntity::detect_equipment_updates(player.as_ref());
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::MainHand,
+            item_stack: ItemStack::new(&vanilla_items::STICK),
+        }]
+    );
+
+    player.inventory.lock().set_selected_slot(1);
+    LivingEntity::detect_equipment_updates(player.as_ref());
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::MainHand,
+            item_stack: ItemStack::new(&vanilla_items::OAK_LOG),
+        }]
+    );
+}
+
+#[test]
+fn equipment_detection_suppresses_exact_hand_swap_packet() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    {
+        let mut inventory = player.inventory.lock();
+        inventory.set_selected_item(ItemStack::new(&vanilla_items::STICK));
+        inventory.set_offhand_item(ItemStack::new(&vanilla_items::SHIELD));
+    }
+    LivingEntity::detect_equipment_updates(player.as_ref());
+    let initial = LivingEntity::drain_dirty_equipment(player.as_ref());
+    assert_eq!(initial.len(), 2);
+
+    assert!(player.inventory.lock().swap_hands());
+    LivingEntity::detect_equipment_updates(player.as_ref());
+
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()).len(),
+        0
+    );
+}
+
+#[test]
+fn equipment_detection_coalesces_before_tracker_drain() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    player.inventory.lock().set(
+        EquipmentSlot::Head,
+        ItemStack::new(&vanilla_items::IRON_HELMET),
+    );
+    LivingEntity::detect_equipment_updates(player.as_ref());
+
+    player.inventory.lock().set(
+        EquipmentSlot::Head,
+        ItemStack::new(&vanilla_items::DIAMOND_HELMET),
+    );
+    LivingEntity::detect_equipment_updates(player.as_ref());
+
+    assert_eq!(
+        LivingEntity::drain_dirty_equipment(player.as_ref()),
+        vec![EquipmentSlotItem {
+            slot: EquipmentSlot::Head,
+            item_stack: ItemStack::new(&vanilla_items::DIAMOND_HELMET),
+        }]
+    );
+}
+
+#[test]
+fn clear_matching_items_uses_inventory_crafting_then_carried_order() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    player
+        .inventory
+        .lock()
+        .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 3));
+    {
+        let inventory_menu = player.inventory_menu.lock();
+        inventory_menu
+            .crafting_container()
+            .expect("inventory menu should have a crafting grid")
+            .lock()
+            .set_item(0, ItemStack::with_count(&vanilla_items::STONE, 2));
+    }
+    *player.inventory_menu.lock().behavior_mut().carried_mut() =
+        ItemStack::with_count(&vanilla_items::STONE, 4);
+
+    let stone = |stack: &ItemStack| stack.is(&vanilla_items::STONE);
+    assert_eq!(player.clear_or_count_matching_items(&stone, 5), 5);
+    assert!(player.inventory.lock().get_item(0).is_empty());
+    assert!(
+        player
+            .inventory_menu
+            .lock()
+            .crafting_container()
+            .expect("inventory menu should have a crafting grid")
+            .lock()
+            .get_item(0)
+            .is_empty()
+    );
+    assert_eq!(player.inventory_menu.lock().behavior().carried().count(), 4);
+
+    assert_eq!(player.clear_or_count_matching_items(&stone, 0), 4);
+    assert_eq!(player.inventory_menu.lock().behavior().carried().count(), 4);
+    assert_eq!(player.clear_or_count_matching_items(&stone, -1), 4);
+    assert!(player.inventory_menu.lock().behavior().carried().is_empty());
+}
+
+#[test]
+fn point_level_up_sound_uses_first_crossed_five_level_boundary() {
+    assert_eq!(first_point_level_up_sound(0, 4, 100), None);
+    assert_eq!(first_point_level_up_sound(0, 5, 100), Some(5));
+    assert_eq!(first_point_level_up_sound(4, 12, 100), Some(5));
+    assert_eq!(first_point_level_up_sound(5, 10, 100), Some(10));
+    assert_eq!(first_point_level_up_sound(5, 10, -100), None);
+}
+
+#[test]
+fn point_grants_update_entity_score_with_java_wrapping() {
+    let player = test_player(Arc::clone(test_world()));
+    player.set_score(i32::MAX - 10);
+
+    player.give_experience_points(100);
+
+    assert_eq!(player.score(), (i32::MAX - 10).wrapping_add(100));
+    assert_eq!(player.experience.lock().total_points(), 100);
+}
+
+#[test]
+fn persistent_player_data_restores_independent_experience_fields_and_score() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    *player.experience.lock() = Experience::from_parts(7, 0.5, 32);
+    player.set_score(19);
+    let persistent = PersistentPlayerData::from_player(&player);
+
+    *player.experience.lock() = Experience::default();
+    player.set_score(-1);
+    persistent.apply_to_player_without_location(&player);
+
+    let experience = player.experience.lock();
+    assert_eq!(experience.level(), 7);
+    assert_eq!(experience.progress().to_bits(), 0.5_f32.to_bits());
+    assert_eq!(experience.total_points(), 32);
+    drop(experience);
+    assert_eq!(player.score(), 19);
+}
+
+#[test]
+fn enchanting_spends_levels_and_rerolls_the_seed() {
+    let mut experience = Experience::from_parts(30, 0.5, 1000).with_enchantment_seed(77);
+    experience.on_enchantment_performed(3, 99);
+    assert_eq!(experience.level(), 27);
+    assert_eq!(experience.enchantment_seed(), 99);
+    assert!(experience.dirty);
+
+    let mut broke = Experience::from_parts(1, 0.5, 20).with_enchantment_seed(77);
+    broke.on_enchantment_performed(3, 5);
+    assert_eq!(broke.level(), 0);
+    assert_eq!(broke.progress().to_bits(), 0.0_f32.to_bits());
+    assert_eq!(broke.total_points(), 0);
+}
+
+#[test]
+fn only_a_zero_saved_enchantment_seed_is_rerolled() {
+    let rerolled = Experience::from_parts(0, 0.0, 0).with_loaded_enchantment_seed(0, || 99);
+    assert_eq!(rerolled.enchantment_seed(), 99);
+
+    let kept = Experience::from_parts(0, 0.0, 0).with_loaded_enchantment_seed(4242, || 99);
+    assert_eq!(kept.enchantment_seed(), 4242);
+}
+
+#[test]
+fn saved_enchantment_seed_round_trips_through_player_data() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("player_data_enchantment_seed_round_trip");
+    let world = &world_fixture.world;
+    let player = TestPlayerBuilder::new(Arc::clone(world), "SeedTester", 1).build();
+
+    let mut stored = PersistentPlayerData::from_player(&player);
+    stored.enchantment_seed = 4242;
+    stored.apply_to_player_without_location(&player);
+    assert_eq!(player.experience.lock().enchantment_seed(), 4242);
+    assert_eq!(
+        PersistentPlayerData::from_player(&player).enchantment_seed,
+        4242
+    );
+}
+
+#[test]
+fn persistent_player_data_restores_equipment_inventory_slots() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+    let helmet = ItemStack::new(&vanilla_items::DIAMOND_HELMET);
+    let saddle = ItemStack::new(&vanilla_items::SADDLE);
+    {
+        let mut inventory = player.inventory.lock();
+        inventory.set(EquipmentSlot::Head, helmet.clone());
+        inventory.set(EquipmentSlot::Saddle, saddle.clone());
+    }
+    let persistent = PersistentPlayerData::from_player(&player);
+
+    {
+        let mut inventory = player.inventory.lock();
+        inventory.clear();
+    }
+    persistent.apply_to_player_without_location(&player);
+
+    let inventory = player.inventory.lock();
+    assert_eq!(inventory.get_ref(EquipmentSlot::Head), &helmet);
+    assert_eq!(inventory.get_ref(EquipmentSlot::Saddle), &saddle);
+}
+
+#[test]
+fn effect_visibility_refresh_preserves_spectator_invisibility() {
+    init_vanilla_registry();
+    let player = test_player(Arc::clone(test_world()));
+
+    player.restore_game_modes(GameType::Spectator, Some(GameType::Survival));
+    player.living_base.mark_effects_dirty();
+    player.update_dirty_mob_effect_entity_data();
+    assert!(player.entity_data.is_base_invisible_flag());
+
+    player.restore_game_modes(GameType::Survival, Some(GameType::Spectator));
+    player.living_base.mark_effects_dirty();
+    player.update_dirty_mob_effect_entity_data();
+    assert!(!player.entity_data.is_base_invisible_flag());
+}
+
+#[test]
+fn block_action_restriction_precedes_redstone_ore_attack() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("redstone_ore_block_action_restriction");
+    let world = &world_fixture.world;
+    let pos = BlockPos::new(1, 64, 0);
+    insert_ready_full_chunk(world, ChunkPos::from_block_pos(pos));
+    assert!(world.set_block(
+        pos,
+        vanilla_blocks::REDSTONE_ORE.default_state(),
+        UpdateFlags::UPDATE_ALL,
+    ));
+
+    let player = test_player(Arc::clone(world));
+    player.base.set_position_local(DVec3::new(1.0, 64.0, 0.0));
+
+    for game_mode in [GameType::Spectator, GameType::Adventure] {
+        player.restore_game_modes(game_mode, None);
+        player.abilities.lock().update_for_game_mode(game_mode);
+        player.block_breaking.lock().handle_block_break_action(
+            &player,
+            world,
+            pos,
+            BlockBreakAction::Start,
+            Direction::Up,
+        );
+        assert!(
+            !world
+                .get_block_state(pos)
+                .get_value(&BlockStateProperties::LIT)
+        );
+    }
+
+    let predicate = BlockPredicate::new(
+        Some(RegistryHolderSet::Direct(vec![
+            &vanilla_blocks::REDSTONE_ORE,
+        ])),
+        None,
+        None,
+        DataComponentMatchers::ANY,
+    );
+    let can_break =
+        AdventureModePredicate::new(vec![predicate]).expect("one block predicate is valid");
+    let mut tool = ItemStack::new(&vanilla_items::DIAMOND_PICKAXE);
+    tool.set(CAN_BREAK, can_break);
+    player.inventory.lock().set_selected_item(tool);
+
+    player.block_breaking.lock().handle_block_break_action(
+        &player,
+        world,
+        pos,
+        BlockBreakAction::Start,
+        Direction::Up,
+    );
+    assert!(
+        world
+            .get_block_state(pos)
+            .get_value(&BlockStateProperties::LIT)
+    );
+}
+
+#[test]
+fn block_action_restriction_is_rechecked_before_block_destruction() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("block_action_restriction_before_destruction");
+    let world = &world_fixture.world;
+    let pos = BlockPos::new(1, 64, 0);
+    insert_ready_full_chunk(world, ChunkPos::from_block_pos(pos));
+    assert!(world.set_block(
+        pos,
+        vanilla_blocks::STONE.default_state(),
+        UpdateFlags::UPDATE_ALL,
+    ));
+
+    let player = test_player(Arc::clone(world));
+    player.base.set_position_local(DVec3::new(1.0, 64.0, 0.0));
+    player.restore_game_modes(GameType::Adventure, None);
+    player
+        .abilities
+        .lock()
+        .update_for_game_mode(GameType::Adventure);
+
+    let predicate = BlockPredicate::new(
+        Some(RegistryHolderSet::Direct(vec![&vanilla_blocks::STONE])),
+        None,
+        None,
+        DataComponentMatchers::ANY,
+    );
+    let mut allowed_tool = ItemStack::new(&vanilla_items::DIAMOND_PICKAXE);
+    allowed_tool.set(
+        CAN_BREAK,
+        AdventureModePredicate::new(vec![predicate]).expect("one block predicate is valid"),
+    );
+    player.inventory.lock().set_selected_item(allowed_tool);
+
+    {
+        let mut breaking = player.block_breaking.lock();
+        breaking.handle_block_break_action(
+            &player,
+            world,
+            pos,
+            BlockBreakAction::Start,
+            Direction::Up,
+        );
+        for _ in 0..3 {
+            breaking.tick(&player, world);
+        }
+    }
+
+    player
+        .inventory
+        .lock()
+        .set_selected_item(ItemStack::new(&vanilla_items::DIAMOND_PICKAXE));
+    player.block_breaking.lock().handle_block_break_action(
+        &player,
+        world,
+        pos,
+        BlockBreakAction::Stop,
+        Direction::Up,
+    );
+
+    assert_eq!(
+        world.get_block_state(pos),
+        vanilla_blocks::STONE.default_state()
+    );
+}
+
+#[test]
+fn creative_drop_throttle_survives_respawn_replacement() {
+    init_vanilla_registry();
+
+    for restore_all in [false, true] {
+        let world_fixture = fresh_test_world("creative_drop_throttle_survives_respawn_replacement");
+        let world = &world_fixture.world;
+        insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+        let player = test_player(Arc::clone(world));
+        *player.game_modes.lock() = PlayerGameModeState::new(GameType::Creative);
+
+        let drop_packet = || SSetCreativeModeSlot {
+            slot_num: -1,
+            item_stack: ItemStack::new(&vanilla_items::DIAMOND),
+        };
+        for _ in 0..(DROP_SPAM_THROTTLER_THRESHOLD / DROP_SPAM_THROTTLER_INCREMENT_STEP) {
+            player.handle_set_creative_mode_slot(drop_packet());
+        }
+        let dropped_before_respawn = world.entity_manager().count();
+
+        let replacement =
+            player.new_respawn_replacement(Arc::clone(world), restore_all, true, true);
+        replacement.handle_set_creative_mode_slot(drop_packet());
+        assert_eq!(world.entity_manager().count(), dropped_before_respawn);
+
+        replacement.tick_throttlers();
+        replacement.handle_set_creative_mode_slot(drop_packet());
+        assert_eq!(world.entity_manager().count(), dropped_before_respawn + 1);
+    }
+}
+
+#[test]
+fn extra_items_created_on_use_fill_inventory_when_there_is_room() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("extra_items_created_on_use_has_room");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+
+    player.handle_extra_items_created_on_use(ItemStack::new(&vanilla_items::GLASS_BOTTLE));
+
+    assert!(
+        player
+            .inventory
+            .lock()
+            .items()
+            .iter()
+            .any(|item| item.is(&vanilla_items::GLASS_BOTTLE))
+    );
+    let dropped = world.get_entities_in_aabb_matching(
+        &WorldAabb::new(-2.0, -1.0, -2.0, 2.0, 3.0, 2.0),
+        |entity| entity.entity_type() == &vanilla_entities::ITEM,
+    );
+    assert!(dropped.is_empty());
+}
+
+#[test]
+fn extra_items_created_on_use_are_dropped_when_inventory_is_full() {
+    init_vanilla_registry();
+    let world_fixture = fresh_test_world("extra_items_created_on_use_full");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+
+    {
+        let mut inventory = player.inventory.lock();
+        for slot in 0..36 {
+            inventory.set_item(slot, ItemStack::with_count(&vanilla_items::STONE, 64));
+        }
+    }
+
+    player.handle_extra_items_created_on_use(ItemStack::new(&vanilla_items::GLASS_BOTTLE));
+
+    assert!(
+        player
+            .inventory
+            .lock()
+            .items()
+            .iter()
+            .all(|item| !item.is(&vanilla_items::GLASS_BOTTLE))
+    );
+    let dropped = world.get_entities_in_aabb_matching(
+        &WorldAabb::new(-2.0, -1.0, -2.0, 2.0, 3.0, 2.0),
+        |entity| entity.entity_type() == &vanilla_entities::ITEM,
+    );
+    assert_eq!(dropped.len(), 1);
+    let Some(item) = dropped[0].as_ref().downcast_ref::<ItemEntity>() else {
+        panic!("dropped entity should retain its concrete item type");
+    };
+    assert!(item.get_item().is(&vanilla_items::GLASS_BOTTLE));
+}
+
+/// Regression test: drinking a honey bottle from a full inventory, through
+/// the real tick loop, must not lose the glass bottle remainder to the
+/// emptied hand slot being seen as free room and then overwritten.
+#[test]
+fn drinking_honey_bottle_from_full_inventory_drops_the_remainder_through_the_tick_loop() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("drink_honey_bottle_tick_loop_full_inventory");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+    let player_entity: SharedEntity = Arc::<Player>::clone(&player);
+
+    {
+        let mut inventory = player.inventory.lock();
+        for slot in 0..36 {
+            inventory.set_item(slot, ItemStack::with_count(&vanilla_items::STONE, 64));
+        }
+        inventory.set_selected_item(ItemStack::with_count(&vanilla_items::HONEY_BOTTLE, 5));
+    }
+
+    player.start_using_item(InteractionHand::MainHand);
+    for _ in 0..40 {
+        player.tick_active_item_use(&player_entity);
+    }
+
+    let hand_item = player
+        .inventory
+        .lock()
+        .get_item_in_hand(InteractionHand::MainHand)
+        .clone();
+    assert!(hand_item.is(&vanilla_items::HONEY_BOTTLE));
+    assert_eq!(hand_item.count(), 4);
+
+    let dropped = world.get_entities_in_aabb_matching(
+        &WorldAabb::new(-2.0, -1.0, -2.0, 2.0, 3.0, 2.0),
+        |entity| entity.entity_type() == &vanilla_entities::ITEM,
+    );
+    assert_eq!(dropped.len(), 1);
+    let Some(item) = dropped[0].as_ref().downcast_ref::<ItemEntity>() else {
+        panic!("dropped entity should retain its concrete item type");
+    };
+    assert!(item.get_item().is(&vanilla_items::GLASS_BOTTLE));
+}
+
+#[test]
+fn throttle_player_dropping_items_from_creative_menu() {
+    const DROPS_ALLOWED_BEFORE_THROTTLE: i32 =
+        DROP_SPAM_THROTTLER_THRESHOLD / DROP_SPAM_THROTTLER_INCREMENT_STEP;
+
+    init_vanilla_registry();
+
+    let item = &*vanilla_items::DIAMOND;
+    let packet = SSetCreativeModeSlot {
+        slot_num: -1,
+        item_stack: ItemStack::new(item),
+    };
+
+    let world_fixture = fresh_test_world("throttle_player_dropping_items_from_creative_menu");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    let player = test_player(Arc::clone(world));
+
+    let check_drop_count = |expected_count: i32| {
+        let item_dropped_stat = vanilla_stat_types::ITEM_DROPPED.get(item);
+        let drop_custom_stat = vanilla_stat_types::CUSTOM.get(&vanilla_custom_stats::DROP);
+
+        assert_eq!(
+            world.entity_manager().count(),
+            expected_count as usize,
+            "entity counts in the world did not match"
+        );
+        let stats = player.stats.lock();
+        assert_eq!(
+            stats.get(&item_dropped_stat),
+            expected_count,
+            "ITEM_DROPPED stat counts did not match"
+        );
+        assert_eq!(
+            stats.get(&drop_custom_stat),
+            expected_count,
+            "DROP custom stat counts did not match"
+        );
+    };
+
+    *player.game_modes.lock() = PlayerGameModeState::new(GameType::Creative);
+
+    // Ensure no remainder for easier logic in the test
+    assert_eq!(
+        DROP_SPAM_THROTTLER_INCREMENT_STEP * DROPS_ALLOWED_BEFORE_THROTTLE,
+        DROP_SPAM_THROTTLER_THRESHOLD,
+        "test assumes that threshold is perfectly divisible by increment step, but that is false"
+    );
+
+    for _ in 0..(DROPS_ALLOWED_BEFORE_THROTTLE + 5) {
+        player.handle_set_creative_mode_slot(packet.clone());
+    }
+    check_drop_count(DROPS_ALLOWED_BEFORE_THROTTLE);
+
+    // Decay the Throttler just enough to allow the player drop one more stack.
+    Arc::clone(&player).tick();
+    player.handle_set_creative_mode_slot(packet.clone());
+    check_drop_count(DROPS_ALLOWED_BEFORE_THROTTLE + 1);
+
+    // Tick the throttler enough times to be a tick away from allowing the player drop one more stack.
+    for _ in 0..(DROP_SPAM_THROTTLER_INCREMENT_STEP - 1) {
+        Arc::clone(&player).tick();
+    }
+    player.handle_set_creative_mode_slot(packet.clone());
+    check_drop_count(DROPS_ALLOWED_BEFORE_THROTTLE + 1);
+
+    // Decay the Throttler just enough to allow the player drop one more stack.
+    Arc::clone(&player).tick();
+    player.handle_set_creative_mode_slot(packet);
+    check_drop_count(DROPS_ALLOWED_BEFORE_THROTTLE + 2);
+}
+
+#[test]
+fn monster_prevents_rest_blocks_sleeping_near_a_bed() {
+    init_vanilla_registry();
+    init_behaviors();
+    let world_fixture = fresh_test_world("monster_prevents_rest");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+    world.set_clock_total_ticks(&vanilla_world_clocks::OVERWORLD, NIGHT_TIME);
+    let bed_pos = BlockPos::new(8, 65, 8);
+    assert!(world.set_block(
+        bed_pos,
+        vanilla_blocks::WHITE_BED.default_state(),
+        UpdateFlags::UPDATE_ALL,
+    ));
+    let player = test_player(Arc::clone(world));
+    player.base.set_position_local(DVec3::new(8.5, 65.0, 8.5));
+
+    assert!(
+        player
+            .start_sleep_in_bed(
+                bed_pos,
+                &world.dimension_type.bed_rule,
+                &vanilla_custom_stats::SLEEP_IN_BED
+            )
+            .is_ok()
+    );
+    assert!(player.is_sleeping());
+    player.stop_sleep_in_bed(false, false);
+
+    let endermite: SharedEntity = Arc::new(EndermiteEntity::new(
+        &vanilla_entities::ENDERMITE,
+        next_entity_id(),
+        DVec3::new(11.0, 65.0, 8.0),
+        Arc::downgrade(world),
+    ));
+    world
+        .try_add_entity(Arc::clone(&endermite))
+        .expect("test endermite should attach to the loaded chunk");
+
+    let result = player.start_sleep_in_bed(
+        bed_pos,
+        &world.dimension_type.bed_rule,
+        &vanilla_custom_stats::SLEEP_IN_BED,
+    );
+    assert!(
+        matches!(result, Err(BedSleepingProblem::NotSafe(_))),
+        "a monster nearby must yield the not-safe problem, got {result:?}"
+    );
+    assert!(!player.is_sleeping());
+}
+
+#[test]
+fn sword_does_not_destroy_blocks_in_creative() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    let world_fixture = fresh_test_world("sword_does_not_destroy_blocks_in_creative");
+    let world = &world_fixture.world;
+    let pos = BlockPos::new(1, 64, 0);
+    insert_ready_full_chunk(world, ChunkPos::from_block_pos(pos));
+    let dirt = vanilla_blocks::DIRT.default_state();
+    assert!(world.set_block(pos, dirt, UpdateFlags::UPDATE_ALL,));
+    let player = test_player(Arc::clone(world));
+    player.restore_game_modes(GameType::Creative, None);
+    player
+        .inventory
+        .lock()
+        .set_selected_item(ItemStack::new(&vanilla_items::DIAMOND_SWORD));
+
+    player.block_breaking.lock().handle_block_break_action(
+        &player,
+        world,
+        pos,
+        BlockBreakAction::Start,
+        Direction::Up,
+    );
+    assert_eq!(
+        world.get_block_state(pos),
+        dirt,
+        "swords should not destroy blocks when player is in creative mode."
+    );
+}
+
+#[test]
+fn player_melee_attack_plays_sound_packets() {
+    init_vanilla_registry();
+    init_behaviors();
+
+    let world_fixture = fresh_test_world("player_melee_attack_sounds");
+    let world = &world_fixture.world;
+    insert_ready_full_chunk(world, ChunkPos::new(0, 0));
+
+    let sent_packets = Arc::new(SyncMutex::new(Vec::new()));
+    let connection = Arc::new(PlayerConnection::Other(Box::new(RecordingConnection {
+        sent_packets: Arc::clone(&sent_packets),
+        closed: AtomicBool::new(false),
+    })));
+    let attacker = TestPlayerBuilder::new(Arc::clone(world), "Attacker", next_entity_id())
+        .connection(connection)
+        .build();
+    attacker.set_client_loaded(true);
+    assert!(world.add_player(Arc::clone(&attacker), ResetReason::InitialJoin));
+
+    let pig = Arc::new(PigEntity::new(
+        &vanilla_entities::PIG,
+        next_entity_id(),
+        DVec3::new(1.0, 64.0, 1.0),
+        Arc::downgrade(world),
+    ));
+    let pig_target: SharedEntity = Arc::<PigEntity>::clone(&pig);
+
+    // 1. Weak attack (freshly reset attack strength ticker, scale <= 0.9)
+    attacker.reset_attack_strength_ticker();
+    sent_packets.lock().clear();
+    assert!(attacker.attack(&pig_target));
+    assert_eq!(
+        sound_packet_ids(&sent_packets.lock()),
+        vec![sound_events::ENTITY_PLAYER_ATTACK_WEAK.packet_holder_id()]
+    );
+
+    // 2. Strong attack (fully charged ticker, scale > 0.9)
+    pig.set_invulnerable_time(0);
+    for _ in 0..40 {
+        attacker.tick_attack_strength();
+    }
+    sent_packets.lock().clear();
+    assert!(attacker.attack(&pig_target));
+    assert_eq!(
+        sound_packet_ids(&sent_packets.lock()),
+        vec![sound_events::ENTITY_PLAYER_ATTACK_STRONG.packet_holder_id()]
+    );
+
+    // 3. Sprinting strong attack (triggers knockback sound + strong sound)
+    pig.set_invulnerable_time(0);
+    for _ in 0..40 {
+        attacker.tick_attack_strength();
+    }
+    attacker.set_sprinting(true);
+    sent_packets.lock().clear();
+    assert!(attacker.attack(&pig_target));
+    assert_eq!(
+        sound_packet_ids(&sent_packets.lock()),
+        vec![
+            sound_events::ENTITY_PLAYER_ATTACK_KNOCKBACK.packet_holder_id(),
+            sound_events::ENTITY_PLAYER_ATTACK_STRONG.packet_holder_id(),
+        ]
+    );
+    attacker.set_sprinting(false);
+
+    // 4. Attack with no damage dealt / target cannot be hurt
+    let dead_pig = Arc::new(PigEntity::new(
+        &vanilla_entities::PIG,
+        next_entity_id(),
+        DVec3::new(1.0, 64.0, 1.0),
+        Arc::downgrade(world),
+    ));
+    dead_pig.set_health(0.0);
+    let dead_target: SharedEntity = Arc::<PigEntity>::clone(&dead_pig);
+    sent_packets.lock().clear();
+    assert!(!attacker.attack(&dead_target));
+    assert_eq!(
+        sound_packet_ids(&sent_packets.lock()),
+        vec![sound_events::ENTITY_PLAYER_ATTACK_NODAMAGE.packet_holder_id()]
+    );
+
+    // 5. Sprinting with attack damage reduced to zero (for example by weakness)
+    // plays no knockback sound, matching vanilla's baseDamage/magicBoost gate.
+    attacker
+        .attributes()
+        .lock()
+        .set_base_value(vanilla_attributes::ATTACK_DAMAGE, 0.0);
+    pig.set_invulnerable_time(0);
+    for _ in 0..40 {
+        attacker.tick_attack_strength();
+    }
+    attacker.set_sprinting(true);
+    sent_packets.lock().clear();
+    assert!(!attacker.attack(&pig_target));
+    assert_eq!(sound_packet_ids(&sent_packets.lock()), Vec::<i32>::new());
+}

@@ -1,0 +1,45 @@
+[package]
+name = "nylium-steel"
+default-run = "nylium-steel"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Embedded SteelMC adapter for Nylium"
+
+[dependencies]
+nylium = { path = "../nylium", optional = true }
+nylium-adapter = { path = "../nylium-adapter", features = ["console"] }
+async-trait = "0.1"
+smol = "2"
+steel = { git = "https://github.com/Steel-Foundation/SteelMC", rev = "fb63e053ea5ecb26dc9faaa3a80e19fb20d7e079", default-features = false }
+steel-core = { git = "https://github.com/Steel-Foundation/SteelMC", rev = "fb63e053ea5ecb26dc9faaa3a80e19fb20d7e079" }
+steel-registry = { git = "https://github.com/Steel-Foundation/SteelMC", rev = "fb63e053ea5ecb26dc9faaa3a80e19fb20d7e079" }
+steel-utils = { git = "https://github.com/Steel-Foundation/SteelMC", rev = "fb63e053ea5ecb26dc9faaa3a80e19fb20d7e079" }
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+toml_edit = "0.23"
+tempfile = "3"
+tracing-log = "0.2"
+text_components = { git = "https://github.com/Steel-Foundation/TextComponents.git", rev = "04d60d0d9c65ab1cb05154105e184d5904e8990b" }
+strip-ansi-escapes = "0.2"
+
+[dev-dependencies]
+log = "0.4"
+
+[workspace]
+
+[features]
+default = []
+ui = ["dep:nylium"]
+
+[[bin]]
+name = "nylium-steel-ui"
+path = "src/gui.rs"
+required-features = ["ui"]
+
+[patch."https://github.com/Steel-Foundation/SteelMC"]
+steel-core = { path = "vendor/steel-core" }

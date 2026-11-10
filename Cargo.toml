@@ -1,31 +1,20 @@
 [workspace]
 resolver = "3"
-members = [
-    "nylium",
-    "nylium-adapter",
-    "nylium-assets",
-]
-
+members = ["nylium", "nylium-adapter"]
+exclude = ["nylium-steel", "nylium-pumpkin"]
 
 [workspace.package]
-version = "0.0.0"
+version = "0.1.0"
 edition = "2024"
 
-
 [workspace.dependencies]
-async-trait = "^0.1.89"
-gpui = { version = "^0.2.2", default-features = false }
-gpui-component = "^0.4.0-preview2"
-quote = "^1.0.42"
-rust-embed = "^8.9.0"
-syn = "^2.0.110"
-uuid = "^1.18.1"
-
+async-trait = "0.1"
+smol = "2"
+uuid = { version = "1", features = ["v4"] }
+gpui = { package = "gpui-pre", version = "=0.3.11", default-features = false }
+ely = { package = "ely-core", git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "8b15334bca4fd6774d50890797be0bfcc7c49a6c", features = ["fonts"] }
+ely-charts = { git = "https://github.com/ELY-Open-Source/Ely-GPUI-Components", rev = "8b15334bca4fd6774d50890797be0bfcc7c49a6c" }
 
 [profile.release]
 lto = true
 codegen-units = 1
-
-
-[profile.bench]
-debug = true

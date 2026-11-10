@@ -1,0 +1,377 @@
+//! Ticket-owned chunk availability requests.
+
+use std::sync::Arc;
+
+use rustc_hash::FxHashSet;
+use steel_utils::ChunkPos;
+
+use crate::chunk::{
+    chunk_holder::ChunkHolder,
+    chunk_map::ChunkMap,
+    chunk_scheduler::ChunkTicketReceipt,
+    chunk_ticket_manager::{ChunkTicketLevel, ticket_level_for_status},
+    status::ChunkStatus,
+};
+
+/// Why a chunk request is holding tickets.
+///
+/// This is request metadata, not a Vanilla ticket type. Every RAII request
+/// uses Steel's `CHUNK_REQUEST` ticket because it releases the ticket on drop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkTicketKind {
+    /// Player-visible chunk loading.
+    Player,
+    /// Initial chunks around a joining player's spawn.
+    PlayerSpawn,
+    /// Candidate chunks loaded while searching for a valid spawn position.
+    SpawnSearch,
+    /// Candidate chunks loaded by structure location queries.
+    StructureLocate,
+    /// Chunks loaded by startup pregeneration.
+    Pregen,
+    /// Generic command-owned chunk request.
+    Command,
+    /// Chunks loaded while preparing a portal destination.
+    Portal,
+}
+
+/// Request for a set of chunks at a minimum generation status.
+pub struct ChunkRequest {
+    /// Minimum chunk status required before the request is ready.
+    pub status: ChunkStatus,
+    /// Chunk positions requested.
+    pub positions: Vec<ChunkPos>,
+    /// Ticket owner category.
+    pub ticket_kind: ChunkTicketKind,
+}
+
+/// Poll result for a [`ChunkRequestHandle`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChunkRequestState {
+    /// The request has outstanding chunks.
+    Pending {
+        /// Number of requested chunks already at the target status.
+        ready: usize,
+        /// Number of requested chunks after deduplication.
+        total: usize,
+    },
+    /// Every requested chunk is available at the target status.
+    Ready,
+    /// The request was cancelled and no longer owns tickets.
+    Cancelled,
+}
+
+/// Chunks passed to request continuations once a request is ready.
+pub struct ReadyChunks {
+    /// Status all holders have reached.
+    pub status: ChunkStatus,
+    /// Holders for the requested positions.
+    pub holders: Vec<Arc<ChunkHolder>>,
+}
+
+/// Owns temporary loading tickets independently of how readiness is checked.
+/// Steel request tickets have no timeout, so every exit must release the lease.
+pub(crate) struct ChunkRequestLease {
+    chunk_map: Arc<ChunkMap>,
+    positions: Box<[ChunkPos]>,
+    ticket_level: ChunkTicketLevel,
+    pub(crate) submission_receipt: Option<ChunkTicketReceipt>,
+}
+
+impl ChunkRequestLease {
+    pub(crate) fn new(
+        chunk_map: Arc<ChunkMap>,
+        positions: Box<[ChunkPos]>,
+        ticket_level: ChunkTicketLevel,
+    ) -> Self {
+        let submission_receipt = chunk_map.acquire_chunk_request_leases(&positions, ticket_level);
+        Self {
+            chunk_map,
+            positions,
+            ticket_level,
+            submission_receipt,
+        }
+    }
+}
+
+impl Drop for ChunkRequestLease {
+    fn drop(&mut self) {
+        let _ = self
+            .chunk_map
+            .release_chunk_request_leases(&self.positions, self.ticket_level);
+    }
+}
+
+struct ChunkRequestInner {
+    lease: ChunkRequestLease,
+    status: ChunkStatus,
+    ticket_kind: ChunkTicketKind,
+}
+
+impl ChunkRequestInner {
+    fn tickets_committed(&self) -> bool {
+        self.lease
+            .submission_receipt
+            .is_none_or(|receipt| self.lease.chunk_map.is_ticket_receipt_committed(receipt))
+    }
+}
+
+/// Handle for a ticketed chunk request.
+///
+/// Dropping or cancelling the handle releases its tickets. The handle never
+/// creates chunk holders directly; lifecycle publication remains owned by the
+/// game-tick boundary.
+pub struct ChunkRequestHandle {
+    inner: Option<ChunkRequestInner>,
+}
+
+impl ChunkRequestHandle {
+    pub(crate) fn new(chunk_map: Arc<ChunkMap>, request: ChunkRequest) -> Self {
+        let positions = dedupe_positions(request.positions);
+        let ticket_level = ticket_level_for_status(request.status);
+        let lease = ChunkRequestLease::new(chunk_map, positions, ticket_level);
+
+        Self {
+            inner: Some(ChunkRequestInner {
+                lease,
+                status: request.status,
+                ticket_kind: request.ticket_kind,
+            }),
+        }
+    }
+
+    /// Returns the requested status, if this handle is still active.
+    #[must_use]
+    pub fn status(&self) -> Option<ChunkStatus> {
+        self.inner.as_ref().map(|inner| inner.status)
+    }
+
+    /// Returns the ticket kind, if this handle is still active.
+    #[must_use]
+    pub fn ticket_kind(&self) -> Option<ChunkTicketKind> {
+        self.inner.as_ref().map(|inner| inner.ticket_kind)
+    }
+
+    /// Returns requested positions after deduplication.
+    #[must_use]
+    pub fn positions(&self) -> &[ChunkPos] {
+        self.inner
+            .as_ref()
+            .map_or(&[], |inner| inner.lease.positions.as_ref())
+    }
+
+    /// Whether the request's tickets are committed, so its chunks stay loaded once they are
+    /// available. `false` once the request is cancelled.
+    #[must_use]
+    pub fn tickets_committed(&self) -> bool {
+        self.inner
+            .as_ref()
+            .is_some_and(ChunkRequestInner::tickets_committed)
+    }
+
+    /// Polls request readiness. The chunk-source phase owns chunk holder
+    /// creation and generation scheduling.
+    #[must_use]
+    pub fn poll(&self) -> ChunkRequestState {
+        let Some(inner) = &self.inner else {
+            return ChunkRequestState::Cancelled;
+        };
+        if inner.lease.positions.is_empty() {
+            return ChunkRequestState::Ready;
+        }
+        // Read before the scan: chunks seen ready afterwards stay held by the committed tickets.
+        let tickets_committed = inner.tickets_committed();
+        let mut ready = 0;
+        for &pos in &inner.lease.positions {
+            let Some(holder) = inner
+                .lease
+                .chunk_map
+                .chunks
+                .read_sync(&pos, |_, holder| Arc::clone(holder))
+            else {
+                continue;
+            };
+
+            if holder.try_chunk(inner.status).is_some() {
+                ready += 1;
+            }
+        }
+
+        if tickets_committed && ready == inner.lease.positions.len() {
+            ChunkRequestState::Ready
+        } else {
+            ChunkRequestState::Pending {
+                ready,
+                total: inner.lease.positions.len(),
+            }
+        }
+    }
+
+    /// Returns holders once every requested chunk is at the target status.
+    #[must_use]
+    pub fn ready_chunks(&self) -> Option<ReadyChunks> {
+        let inner = self.inner.as_ref()?;
+        if !inner.tickets_committed() {
+            return None;
+        }
+        let mut holders = Vec::with_capacity(inner.lease.positions.len());
+
+        for &pos in &inner.lease.positions {
+            let holder = inner
+                .lease
+                .chunk_map
+                .chunks
+                .read_sync(&pos, |_, holder| Arc::clone(holder))?;
+            {
+                let _chunk = holder.try_chunk(inner.status)?;
+            }
+            holders.push(holder);
+        }
+
+        Some(ReadyChunks {
+            status: inner.status,
+            holders,
+        })
+    }
+
+    /// Cancels the request and releases its tickets.
+    pub fn cancel(&mut self) {
+        drop(self.inner.take());
+    }
+}
+
+impl ChunkMap {
+    /// Adds tickets for a chunk request and returns a pollable handle.
+    ///
+    /// The returned handle owns the tickets. The chunk-source phase handles
+    /// holder creation and generation scheduling.
+    #[must_use]
+    pub fn request_chunks(self: &Arc<Self>, request: ChunkRequest) -> ChunkRequestHandle {
+        ChunkRequestHandle::new(Arc::clone(self), request)
+    }
+
+    /// Requests one chunk at `status`.
+    #[must_use]
+    pub fn request_chunk(
+        self: &Arc<Self>,
+        pos: ChunkPos,
+        status: ChunkStatus,
+        ticket_kind: ChunkTicketKind,
+    ) -> ChunkRequestHandle {
+        self.request_chunks(ChunkRequest {
+            status,
+            positions: vec![pos],
+            ticket_kind,
+        })
+    }
+
+    /// Requests a square of chunks centered on `center`.
+    #[must_use]
+    pub fn request_square(
+        self: &Arc<Self>,
+        center: ChunkPos,
+        radius: u8,
+        status: ChunkStatus,
+        ticket_kind: ChunkTicketKind,
+    ) -> ChunkRequestHandle {
+        let radius = i32::from(radius);
+        let diameter = radius * 2 + 1;
+        let capacity = (diameter * diameter) as usize;
+        let mut positions = Vec::with_capacity(capacity);
+
+        for dz in -radius..=radius {
+            for dx in -radius..=radius {
+                positions.push(ChunkPos::new(center.0.x + dx, center.0.y + dz));
+            }
+        }
+
+        self.request_chunks(ChunkRequest {
+            status,
+            positions,
+            ticket_kind,
+        })
+    }
+}
+
+fn dedupe_positions(positions: Vec<ChunkPos>) -> Box<[ChunkPos]> {
+    let mut seen = FxHashSet::default();
+    let mut deduped = Vec::with_capacity(positions.len());
+    for pos in positions {
+        if seen.insert(pos) {
+            deduped.push(pos);
+        }
+    }
+    deduped.into_boxed_slice()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::fresh_test_world;
+    use std::{thread, time::Duration};
+
+    fn drive_request_until_ready(chunk_map: &Arc<ChunkMap>, request: &ChunkRequestHandle) {
+        for _ in 0..10_000 {
+            chunk_map.advance_scheduling();
+            if request.poll() == ChunkRequestState::Ready {
+                return;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        panic!("chunk request did not become ready");
+    }
+
+    #[test]
+    fn dedupe_positions_preserves_first_occurrence_order() {
+        let positions = dedupe_positions(vec![
+            ChunkPos::new(1, 2),
+            ChunkPos::new(3, 4),
+            ChunkPos::new(1, 2),
+        ]);
+        assert_eq!(&*positions, &[ChunkPos::new(1, 2), ChunkPos::new(3, 4)]);
+    }
+
+    #[test]
+    fn ready_chunk_still_waits_for_its_ticket_receipt_to_commit() {
+        let world_fixture = fresh_test_world("chunk_request_receipt");
+        let world = &world_fixture.world;
+        let pos = ChunkPos::new(4, -7);
+        let first =
+            world
+                .chunk_map
+                .request_chunk(pos, ChunkStatus::Empty, ChunkTicketKind::Command);
+        drive_request_until_ready(&world.chunk_map, &first);
+
+        let second =
+            world
+                .chunk_map
+                .request_chunk(pos, ChunkStatus::Empty, ChunkTicketKind::Command);
+
+        assert_eq!(
+            second.poll(),
+            ChunkRequestState::Pending { ready: 1, total: 1 }
+        );
+        assert!(second.ready_chunks().is_none());
+        assert!(!second.tickets_committed());
+
+        drive_request_until_ready(&world.chunk_map, &second);
+        assert!(second.ready_chunks().is_some());
+        assert!(second.tickets_committed());
+    }
+
+    #[test]
+    fn a_cancelled_request_has_no_committed_tickets() {
+        let world_fixture = fresh_test_world("chunk_request_cancel");
+        let world = &world_fixture.world;
+        let mut request = world.chunk_map.request_chunk(
+            ChunkPos::new(1, 1),
+            ChunkStatus::Empty,
+            ChunkTicketKind::Command,
+        );
+        drive_request_until_ready(&world.chunk_map, &request);
+        assert!(request.tickets_committed());
+
+        request.cancel();
+        assert!(!request.tickets_committed());
+    }
+}

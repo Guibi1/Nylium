@@ -1,0 +1,83 @@
+//! Item behavior implementations.
+//!
+//! The actual behavior registration is auto-generated from classes.json.
+//! See `src/behavior/generated/items.rs` for the generated registration code.
+
+mod air;
+mod block_item;
+pub(crate) mod block_transformer;
+mod bonemeal;
+mod bottle;
+mod brush;
+mod bucket;
+mod compass;
+mod copper_chest_events;
+mod default;
+mod dye;
+mod dynamic_name;
+mod egg;
+mod ender_eye;
+mod ender_pearl;
+mod firework_rocket;
+mod food_on_a_stick;
+mod hanging_sign_item;
+mod honeycomb;
+mod ink_sac;
+mod mace;
+mod minecart;
+mod name_tag;
+mod place_on_water_block_item;
+mod player_head;
+mod potion;
+mod scaffolding_block_item;
+mod shears;
+mod shield;
+mod snowball;
+mod solid_bucket_item;
+mod spawn_egg;
+mod spyglass;
+mod standing_and_wall_block_item;
+mod throw_projectile;
+mod throwable_potion;
+mod tipped_arrow;
+
+mod fishing_rod;
+mod flint_and_steel;
+mod lead;
+
+pub use air::AirItem;
+pub use block_item::{BlockItem, DoubleHighBlockItem};
+pub use bonemeal::BoneMealItem;
+pub use bottle::BottleItem;
+pub use brush::BrushItem;
+pub use bucket::BucketItem;
+pub use compass::CompassItem;
+pub use default::DefaultItemBehavior;
+pub use dye::DyeItem;
+pub use egg::EggItem;
+pub use ender_eye::EnderEyeItem;
+pub use ender_pearl::EnderPearlItem;
+pub use firework_rocket::FireworkRocketItem;
+pub use fishing_rod::FishingRodItem;
+pub use flint_and_steel::{FireChargeItem, FlintAndSteelItem};
+pub use food_on_a_stick::FoodOnAStickItem;
+pub use hanging_sign_item::HangingSignItem;
+pub use honeycomb::HoneycombItem;
+pub use ink_sac::{GlowInkSacItem, InkSacItem};
+pub use lead::LeadItem;
+pub use mace::MaceItem;
+pub use minecart::MinecartItem;
+pub use name_tag::NameTagItem;
+pub use place_on_water_block_item::PlaceOnWaterBlockItem;
+pub use player_head::PlayerHeadItem;
+pub use potion::PotionItem;
+pub use scaffolding_block_item::ScaffoldingBlockItem;
+pub use shears::ShearsItem;
+pub use shield::ShieldItem;
+pub use snowball::SnowballItem;
+pub use solid_bucket_item::SolidBucketItem;
+pub use spawn_egg::SpawnEggItem;
+pub use spyglass::SpyglassItem;
+pub use standing_and_wall_block_item::StandingAndWallBlockItem;
+pub use throwable_potion::{LingeringPotionItem, SplashPotionItem};
+pub use tipped_arrow::TippedArrowItem;

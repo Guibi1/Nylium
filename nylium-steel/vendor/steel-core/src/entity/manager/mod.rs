@@ -1,0 +1,2441 @@
+//! World-level entity ownership and lookup.
+//!
+//! Steel deliberately uses a simpler loaded/simulated split than vanilla's
+//! entity section manager. The manager owns runtime entity lookup regardless
+//! of chunk load state; chunks are still the persistence boundary, and only
+//! full simulated chunks tick entities.
+
+use std::{collections::BTreeMap, error::Error, fmt, iter::FusedIterator, mem, slice, sync::Arc};
+
+use glam::DVec3;
+use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
+use steel_registry::vanilla_entities;
+use steel_utils::locks::SyncRwLock;
+use steel_utils::{BlockPos, ChunkPos, PackedSectionPos, SectionPos, WorldAabb};
+use uuid::Uuid;
+
+use self::entries::{EntityEntries, EntitySlot};
+use self::spatial_query::EntityQueryEntries;
+use super::ticking::VehicleChain;
+use super::{
+    Entity, NullEntityCallback, RemovalReason, SharedEntity, snapshot_old_pos_and_rot_for_tick,
+    tick_vehicle_passengers_if,
+};
+
+// Vanilla treats four blocks as the largest ordinary entity search extent.
+const ENTITY_SPATIAL_CELL_SIZE: f64 = 4.0;
+
+// Center common integer positions inside cells instead of on cell boundaries.
+const ENTITY_SPATIAL_CELL_OFFSET: f64 = ENTITY_SPATIAL_CELL_SIZE / 2.0;
+
+// Large queries scan occupied cells instead of materializing an enormous cell range.
+const MAX_DIRECT_SPATIAL_CELL_PROBES: i128 = 4_096;
+const INLINE_QUERY_CAPACITY: usize = 32;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct EntitySpatialCell {
+    x: i32,
+    y: i32,
+    z: i32,
+}
+
+impl EntitySpatialCell {
+    fn containing(x: f64, y: f64, z: f64) -> Self {
+        Self {
+            x: ((x + ENTITY_SPATIAL_CELL_OFFSET) / ENTITY_SPATIAL_CELL_SIZE).floor() as i32,
+            y: ((y + ENTITY_SPATIAL_CELL_OFFSET) / ENTITY_SPATIAL_CELL_SIZE).floor() as i32,
+            z: ((z + ENTITY_SPATIAL_CELL_OFFSET) / ENTITY_SPATIAL_CELL_SIZE).floor() as i32,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct EntityQueryOrder {
+    section: PackedSectionPos,
+    insertion: u64,
+}
+
+/// Candidate set used by vanilla movement's entity-shape collision query.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum EntityCollisionCandidates {
+    /// Scan every spatially indexed entity because the source may broaden the default rule.
+    All,
+    /// Scan only entities that may be hard-collision targets.
+    HardCollisionRelevant,
+}
+
+impl EntityCollisionCandidates {
+    /// Selects the exact-safe broad phase for an optional movement source.
+    #[must_use]
+    pub(crate) fn for_source(source: Option<&dyn Entity>) -> Self {
+        if source.is_some_and(Entity::is_hard_collision_relevant) {
+            Self::All
+        } else {
+            Self::HardCollisionRelevant
+        }
+    }
+}
+
+/// Bounds an index update can leave in place when an entity's old and new cells overlap.
+#[derive(Debug, Clone, Copy)]
+struct RetainedSpatialCells {
+    /// Bounds of the old cells; new cells inside them are already indexed.
+    previous: Option<EntitySpatialCellBounds>,
+    /// Bounds of the new cells; old cells inside them stay indexed.
+    current: Option<EntitySpatialCellBounds>,
+}
+
+impl RetainedSpatialCells {
+    const NONE: Self = Self {
+        previous: None,
+        current: None,
+    };
+
+    const fn between(previous: &[EntitySpatialCell], current: &[EntitySpatialCell]) -> Self {
+        if !EntitySpatialCellBounds::cells_overlap(previous, current) {
+            return Self::NONE;
+        }
+
+        Self {
+            previous: EntitySpatialCellBounds::from_cells(previous),
+            current: EntitySpatialCellBounds::from_cells(current),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct EntitySpatialCellBounds {
+    minimum: EntitySpatialCell,
+    maximum: EntitySpatialCell,
+}
+
+impl EntitySpatialCellBounds {
+    fn from_aabb(aabb: &WorldAabb) -> Self {
+        Self {
+            minimum: EntitySpatialCell::containing(aabb.min_x(), aabb.min_y(), aabb.min_z()),
+            maximum: EntitySpatialCell::containing(aabb.max_x(), aabb.max_y(), aabb.max_z()),
+        }
+    }
+
+    const fn from_cells(cells: &[EntitySpatialCell]) -> Option<Self> {
+        // `cells` is a complete rectangular range in x/y/z order, so its endpoints are the bounds.
+        let (Some(&minimum), Some(&maximum)) = (cells.first(), cells.last()) else {
+            return None;
+        };
+
+        Some(Self { minimum, maximum })
+    }
+
+    const fn cells_overlap(first: &[EntitySpatialCell], second: &[EntitySpatialCell]) -> bool {
+        let (Some(first), Some(second)) = (Self::from_cells(first), Self::from_cells(second))
+        else {
+            return false;
+        };
+
+        first.minimum.x <= second.maximum.x
+            && second.minimum.x <= first.maximum.x
+            && first.minimum.y <= second.maximum.y
+            && second.minimum.y <= first.maximum.y
+            && first.minimum.z <= second.maximum.z
+            && second.minimum.z <= first.maximum.z
+    }
+
+    const fn contains(self, cell: EntitySpatialCell) -> bool {
+        cell.x >= self.minimum.x
+            && cell.x <= self.maximum.x
+            && cell.y >= self.minimum.y
+            && cell.y <= self.maximum.y
+            && cell.z >= self.minimum.z
+            && cell.z <= self.maximum.z
+    }
+
+    fn direct_probe_count(self) -> i128 {
+        let width = i128::from(self.maximum.x) - i128::from(self.minimum.x) + 1;
+        let height = i128::from(self.maximum.y) - i128::from(self.minimum.y) + 1;
+        let depth = i128::from(self.maximum.z) - i128::from(self.minimum.z) + 1;
+        width * height * depth
+    }
+
+    fn cells(self) -> SmallVec<[EntitySpatialCell; 8]> {
+        let mut cells = SmallVec::new();
+        for x in self.minimum.x..=self.maximum.x {
+            for y in self.minimum.y..=self.maximum.y {
+                for z in self.minimum.z..=self.maximum.z {
+                    cells.push(EntitySpatialCell { x, y, z });
+                }
+            }
+        }
+        cells
+    }
+}
+
+/// Error returned when adding an entity to the runtime world fails.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AddEntityError {
+    /// The entity is in a chunk that is not active in the world entity manager.
+    ChunkNotLoaded {
+        /// Entity network ID.
+        entity_id: i32,
+        /// Chunk containing the entity.
+        chunk: ChunkPos,
+    },
+    /// Another live entity with the same persistent UUID is already registered.
+    DuplicateUuid {
+        /// Entity network ID.
+        entity_id: i32,
+        /// Duplicate persistent UUID.
+        uuid: Uuid,
+    },
+    /// Another live entity with the same runtime network ID is already registered.
+    DuplicateId {
+        /// Duplicate entity network ID.
+        entity_id: i32,
+    },
+    /// The entity is already removed and cannot be added to the live world.
+    RemovedEntity {
+        /// Entity network ID.
+        entity_id: i32,
+    },
+}
+
+impl fmt::Display for AddEntityError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::ChunkNotLoaded { entity_id, chunk } => {
+                write!(f, "entity {entity_id} is in non-loaded chunk {chunk:?}")
+            }
+            Self::DuplicateUuid { entity_id, uuid } => {
+                write!(f, "entity {entity_id} has duplicate UUID {uuid}")
+            }
+            Self::DuplicateId { entity_id } => {
+                write!(f, "entity {entity_id} has a duplicate runtime ID")
+            }
+            Self::RemovedEntity { entity_id } => {
+                write!(f, "entity {entity_id} is already removed")
+            }
+        }
+    }
+}
+
+impl Error for AddEntityError {}
+
+/// Error returned when a live entity move cannot be committed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EntityMoveError {
+    /// The entity is no longer managed as live world state.
+    NotLive {
+        /// Entity network ID.
+        entity_id: i32,
+    },
+    /// The entity is deliberately frozen outside live world membership.
+    Inactive {
+        /// Entity network ID.
+        entity_id: i32,
+    },
+    /// The entity tried to move into a chunk outside active world ownership.
+    UnloadedDestination {
+        /// Entity network ID.
+        entity_id: i32,
+        /// Destination chunk.
+        chunk: ChunkPos,
+    },
+    /// invalid sleep block
+    InvalidSleepPosition {
+        /// entity id
+        entity_id: i32,
+        /// bed position
+        bed_position: BlockPos,
+    },
+}
+
+impl fmt::Display for EntityMoveError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::NotLive { entity_id } => {
+                write!(f, "entity {entity_id} is not live in the world")
+            }
+            Self::Inactive { entity_id } => {
+                write!(f, "entity {entity_id} is inactive outside live world state")
+            }
+            Self::UnloadedDestination { entity_id, chunk } => {
+                write!(
+                    f,
+                    "entity {entity_id} cannot move into non-loaded chunk {chunk:?}"
+                )
+            }
+            Self::InvalidSleepPosition {
+                entity_id,
+                bed_position,
+            } => {
+                write!(
+                    f,
+                    "entity {entity_id} cannot sleep at invalid bed position {bed_position:?}"
+                )
+            }
+        }
+    }
+}
+
+impl Error for EntityMoveError {}
+
+/// Whether the manager owns persistence for an entity.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityOwnership {
+    /// Normal non-player entity owned by the world entity manager.
+    ManagerOwned,
+    /// Entity whose lifetime is owned elsewhere, such as a player.
+    External,
+}
+
+/// Entity visibility for a chunk column.
+///
+/// Mirrors vanilla `Visibility`: hidden chunks keep entity data inactive,
+/// tracked chunks expose entities to lookup/tracking, and ticking chunks also
+/// run manager-owned entity ticks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EntityVisibility {
+    /// Not accessible to entity lookup/tracking and not ticking.
+    Hidden,
+    /// Accessible to entity lookup/tracking but not ticking.
+    Tracked,
+    /// Accessible to entity lookup/tracking and ticking.
+    Ticking,
+}
+
+impl EntityVisibility {
+    /// Returns whether entities in this visibility are accessible to queries and tracking.
+    #[must_use]
+    pub const fn is_accessible(self) -> bool {
+        matches!(self, Self::Tracked | Self::Ticking)
+    }
+
+    /// Returns whether entities in this visibility are eligible for ticking.
+    #[must_use]
+    pub const fn is_ticking(self) -> bool {
+        matches!(self, Self::Ticking)
+    }
+}
+
+/// Entity lifecycle changes caused by manager membership or visibility updates.
+#[derive(Default)]
+pub struct EntityLifecycleChanges {
+    /// Entities that became tracked.
+    pub tracking_started: Vec<SharedEntity>,
+    /// Entities that stopped being tracked.
+    pub tracking_stopped: Vec<SharedEntity>,
+    /// Entities that entered the world entity tick list.
+    pub ticking_started: Vec<SharedEntity>,
+    /// Entities that left the world entity tick list.
+    pub ticking_stopped: Vec<SharedEntity>,
+}
+
+impl fmt::Debug for EntityLifecycleChanges {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("EntityLifecycleChanges")
+            .field("tracking_started", &self.tracking_started.len())
+            .field("tracking_stopped", &self.tracking_stopped.len())
+            .field("ticking_started", &self.ticking_started.len())
+            .field("ticking_stopped", &self.ticking_stopped.len())
+            .finish()
+    }
+}
+
+impl EntityLifecycleChanges {
+    fn extend(&mut self, other: Self) {
+        self.tracking_started.extend(other.tracking_started);
+        self.tracking_stopped.extend(other.tracking_stopped);
+        self.ticking_started.extend(other.ticking_started);
+        self.ticking_stopped.extend(other.ticking_stopped);
+    }
+}
+
+/// Section/chunk membership update caused by a committed entity move.
+#[derive(Debug, Clone)]
+pub struct EntityMoveUpdate {
+    /// Entity network ID.
+    pub entity_id: i32,
+    /// Previous section membership.
+    pub old_section: SectionPos,
+    /// New section membership.
+    pub new_section: SectionPos,
+    /// Previous chunk membership.
+    pub old_chunk: ChunkPos,
+    /// New chunk membership.
+    pub new_chunk: ChunkPos,
+    /// Whether the entity was visible to normal world/tracker queries before the move.
+    pub old_accessible: bool,
+    /// Whether the entity is visible to normal world/tracker queries after the move.
+    pub new_accessible: bool,
+    /// Whether the manager-owned entity was in the tick list before the move.
+    pub old_ticking: bool,
+    /// Whether the manager-owned entity is in the tick list after the move.
+    pub new_ticking: bool,
+}
+
+impl EntityMoveUpdate {
+    /// Returns whether the entity changed sections.
+    #[must_use]
+    pub fn section_changed(&self) -> bool {
+        self.old_section != self.new_section
+    }
+
+    /// Returns whether the entity changed chunks.
+    #[must_use]
+    pub fn chunk_changed(&self) -> bool {
+        self.old_chunk != self.new_chunk
+    }
+
+    /// Returns whether the entity crossed an accessibility boundary.
+    #[must_use]
+    pub const fn accessibility_changed(&self) -> bool {
+        self.old_accessible != self.new_accessible
+    }
+
+    /// Returns whether this move made a previously hidden entity accessible.
+    #[must_use]
+    pub const fn became_accessible(&self) -> bool {
+        !self.old_accessible && self.new_accessible
+    }
+
+    /// Returns whether this move made a previously accessible entity hidden.
+    #[must_use]
+    pub const fn became_inaccessible(&self) -> bool {
+        self.old_accessible && !self.new_accessible
+    }
+
+    /// Returns whether this move made a previously non-ticking entity tick.
+    #[must_use]
+    pub const fn became_ticking(&self) -> bool {
+        !self.old_ticking && self.new_ticking
+    }
+
+    /// Returns whether this move made a previously ticking entity stop ticking.
+    #[must_use]
+    pub const fn became_non_ticking(&self) -> bool {
+        self.old_ticking && !self.new_ticking
+    }
+}
+
+/// Saveable entity that could not be persisted by a chunk save pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnsavedEntityReport {
+    /// Entity network ID.
+    pub entity_id: i32,
+    /// Entity persistent UUID.
+    pub uuid: Uuid,
+    /// Chunk containing the entity.
+    pub chunk: ChunkPos,
+}
+
+/// Entity changes produced when a chunk becomes loaded.
+#[derive(Default)]
+pub struct ChunkEntityLoadResult {
+    /// Retained entities restored to live world membership.
+    pub restored: Vec<SharedEntity>,
+    /// Live entities in this chunk whose tracking became visible again.
+    pub tracking_started: Vec<SharedEntity>,
+    /// Live entities in this chunk whose ticking became active again.
+    pub ticking_started: Vec<SharedEntity>,
+    /// Whether recovery created save-pending entity state for this chunk.
+    pub needs_save: bool,
+}
+
+/// Entity changes produced when a chunk starts unloading.
+#[derive(Default)]
+pub struct ChunkEntityUnloadStart {
+    /// Entities removed from live ownership and retained for chunk recovery.
+    pub retained: Vec<SharedEntity>,
+    /// Entities whose tracker visibility should stop for this chunk transition.
+    pub tracking_stopped: Vec<SharedEntity>,
+    /// Entities whose ticking should stop for this chunk transition.
+    pub ticking_stopped: Vec<SharedEntity>,
+}
+
+#[derive(Clone)]
+struct EntityEntry {
+    entity: SharedEntity,
+    _damage_history_owner: Arc<()>,
+    uuid: Uuid,
+    section: SectionPos,
+    chunk: ChunkPos,
+    bounding_box: WorldAabb,
+    spatial_cells: SmallVec<[EntitySpatialCell; 8]>,
+    hard_collision_relevant: bool,
+    query_order: EntityQueryOrder,
+    accessible: bool,
+    ownership: EntityOwnership,
+}
+
+/// Pre-tick manager state resolved under one state lock.
+struct TickContext {
+    manager_chunk: Option<ChunkPos>,
+}
+
+impl EntityEntry {
+    fn new(entity: SharedEntity, ownership: EntityOwnership) -> Self {
+        let section = SectionPos::from_entity_pos(entity.position());
+        let chunk = ChunkPos::new(section.x(), section.z());
+        let bounding_box = entity.bounding_box();
+        let hard_collision_relevant = entity.is_hard_collision_relevant();
+        Self {
+            _damage_history_owner: entity.base().damage_history().retain_owner(),
+            uuid: entity.uuid(),
+            entity,
+            section,
+            chunk,
+            bounding_box,
+            spatial_cells: EntitySpatialCellBounds::from_aabb(&bounding_box).cells(),
+            hard_collision_relevant,
+            query_order: EntityQueryOrder {
+                section: PackedSectionPos::from(section),
+                insertion: 0,
+            },
+            accessible: false,
+            ownership,
+        }
+    }
+
+    #[must_use]
+    fn should_save(&self) -> bool {
+        self.ownership == EntityOwnership::ManagerOwned
+            && (!self.entity.is_removed()
+                || self
+                    .entity
+                    .removal_reason()
+                    .is_some_and(RemovalReason::should_save))
+            && !self.entity.is_passenger()
+            && !self.entity.has_exactly_one_player_passenger()
+            && self.entity.entity_type().can_serialize
+    }
+}
+
+#[derive(Default)]
+struct ManagerState {
+    chunk_visibility: FxHashMap<ChunkPos, EntityVisibility>,
+    live_by_id: EntityEntries,
+    live_by_uuid: FxHashMap<Uuid, i32>,
+    accessible_order: IndexedOrderedEntityIds,
+    by_section: BTreeMap<PackedSectionPos, OrderedEntityIds>,
+    by_spatial_cell: FxHashMap<EntitySpatialCell, SpatialCellEntities>,
+    by_hard_collision_cell: FxHashMap<EntitySpatialCell, SpatialCellEntities>,
+    by_chunk: FxHashMap<ChunkPos, FxHashSet<i32>>,
+    unloading_by_chunk: FxHashMap<ChunkPos, Vec<EntityEntry>>,
+    save_pending_by_chunk: FxHashMap<ChunkPos, Vec<EntityEntry>>,
+    tick_list: EntityTickList,
+    next_section_order: u64,
+}
+
+#[derive(Default)]
+struct OrderedEntityIds {
+    ids: Vec<i32>,
+}
+
+#[derive(Default)]
+struct SpatialCellEntities {
+    entities: Vec<EntitySlot>,
+}
+
+impl OrderedEntityIds {
+    fn insert(&mut self, entity_id: i32) -> bool {
+        if self.ids.contains(&entity_id) {
+            return false;
+        }
+        self.ids.push(entity_id);
+        true
+    }
+
+    fn remove(&mut self, entity_id: i32) -> bool {
+        let Some(index) = self.ids.iter().position(|id| *id == entity_id) else {
+            return false;
+        };
+        self.ids.remove(index);
+
+        true
+    }
+
+    const fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    fn iter(&self) -> slice::Iter<'_, i32> {
+        self.ids.iter()
+    }
+}
+
+/// Append-ordered IDs with indexed unlinking for large lifecycle lists.
+///
+/// Free nodes are reused, and geometric compaction keeps removals amortized constant-time.
+#[derive(Default)]
+struct IndexedOrderedEntityIds {
+    nodes: Vec<OrderedEntityIdNode>,
+    node_by_id: FxHashMap<i32, usize>,
+    first: Option<usize>,
+    last: Option<usize>,
+    free: Option<usize>,
+}
+
+struct OrderedEntityIdNode {
+    entity_id: i32,
+    previous: Option<usize>,
+    next: Option<usize>,
+}
+
+impl IndexedOrderedEntityIds {
+    const MIN_COMPACTION_SIZE: usize = 64;
+
+    fn insert(&mut self, entity_id: i32) -> bool {
+        if self.node_by_id.contains_key(&entity_id) {
+            return false;
+        }
+        let previous = self.last;
+        let index = if let Some(free) = self.free {
+            self.free = self.nodes[free].next;
+            free
+        } else {
+            let index = self.nodes.len();
+            self.nodes.push(OrderedEntityIdNode {
+                entity_id,
+                previous: None,
+                next: None,
+            });
+            index
+        };
+
+        self.nodes[index] = OrderedEntityIdNode {
+            entity_id,
+            previous,
+            next: None,
+        };
+        let replaced = self.node_by_id.insert(entity_id, index);
+        debug_assert!(replaced.is_none());
+
+        if let Some(previous) = previous {
+            self.nodes[previous].next = Some(index);
+        } else {
+            self.first = Some(index);
+        }
+        self.last = Some(index);
+        true
+    }
+
+    fn remove(&mut self, entity_id: i32) -> bool {
+        let Some(index) = self.node_by_id.remove(&entity_id) else {
+            return false;
+        };
+
+        let previous = self.nodes[index].previous;
+        let next = self.nodes[index].next;
+        if let Some(previous) = previous {
+            self.nodes[previous].next = next;
+        } else {
+            self.first = next;
+        }
+        if let Some(next) = next {
+            self.nodes[next].previous = previous;
+        } else {
+            self.last = previous;
+        }
+
+        self.nodes[index] = OrderedEntityIdNode {
+            entity_id,
+            previous: None,
+            next: self.free,
+        };
+        self.free = Some(index);
+        self.compact_if_sparse();
+        true
+    }
+
+    fn len(&self) -> usize {
+        self.node_by_id.len()
+    }
+
+    fn iter(&self) -> IndexedOrderedEntityIdsIter<'_> {
+        IndexedOrderedEntityIdsIter {
+            nodes: &self.nodes,
+            next: self.first,
+            remaining: self.len(),
+        }
+    }
+
+    fn compact_if_sparse(&mut self) {
+        let live_len = self.len();
+        if self.nodes.len() < Self::MIN_COMPACTION_SIZE || live_len > self.nodes.len() / 2 {
+            return;
+        }
+
+        let mut compacted_nodes: Vec<OrderedEntityIdNode> = Vec::with_capacity(live_len);
+        let mut compacted_node_by_id = FxHashMap::default();
+        compacted_node_by_id.reserve(live_len);
+        let mut current = self.first;
+        while let Some(index) = current {
+            let node = &self.nodes[index];
+            let compacted_index = compacted_nodes.len();
+            let previous = compacted_index.checked_sub(1);
+            if let Some(previous) = previous {
+                compacted_nodes[previous].next = Some(compacted_index);
+            }
+            compacted_nodes.push(OrderedEntityIdNode {
+                entity_id: node.entity_id,
+                previous,
+                next: None,
+            });
+            compacted_node_by_id.insert(node.entity_id, compacted_index);
+            current = node.next;
+        }
+        debug_assert_eq!(compacted_nodes.len(), live_len);
+
+        self.nodes = compacted_nodes;
+        self.node_by_id = compacted_node_by_id;
+        self.first = (!self.nodes.is_empty()).then_some(0);
+        self.last = self.nodes.len().checked_sub(1);
+        self.free = None;
+    }
+}
+
+struct IndexedOrderedEntityIdsIter<'a> {
+    nodes: &'a [OrderedEntityIdNode],
+    next: Option<usize>,
+    remaining: usize,
+}
+
+impl<'a> Iterator for IndexedOrderedEntityIdsIter<'a> {
+    type Item = &'a i32;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let index = self.next?;
+        let node = &self.nodes[index];
+        self.next = node.next;
+        self.remaining -= 1;
+        Some(&node.entity_id)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        (self.remaining, Some(self.remaining))
+    }
+}
+
+impl ExactSizeIterator for IndexedOrderedEntityIdsIter<'_> {}
+impl FusedIterator for IndexedOrderedEntityIdsIter<'_> {}
+
+#[derive(Default)]
+struct EntityTickList {
+    active: FxHashMap<i32, SharedEntity>,
+    order: IndexedOrderedEntityIds,
+}
+
+impl EntityTickList {
+    fn add(&mut self, entity: &SharedEntity) -> bool {
+        let entity_id = entity.id();
+        if self.active.insert(entity_id, Arc::clone(entity)).is_some() {
+            return false;
+        }
+        self.order.insert(entity_id);
+        true
+    }
+
+    fn remove(&mut self, entity_id: i32) -> Option<SharedEntity> {
+        let removed = self.active.remove(&entity_id)?;
+        let removed_from_order = self.order.remove(entity_id);
+        debug_assert!(removed_from_order);
+        Some(removed)
+    }
+
+    fn contains(&self, entity_id: i32) -> bool {
+        self.active.contains_key(&entity_id)
+    }
+
+    fn snapshot(&self) -> Vec<SharedEntity> {
+        let mut snapshot = Vec::with_capacity(self.order.len());
+        for entity_id in self.order.iter() {
+            if let Some(entity) = self.active.get(entity_id) {
+                snapshot.push(Arc::clone(entity));
+            }
+        }
+        snapshot
+    }
+}
+
+/// Central world entity manager.
+pub struct WorldEntityManager {
+    state: SyncRwLock<ManagerState>,
+}
+
+impl fmt::Debug for WorldEntityManager {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let state = self.state.read();
+        f.debug_struct("WorldEntityManager")
+            .field("chunk_visibility", &state.chunk_visibility.len())
+            .field("live_entities", &state.live_by_id.len())
+            .field("unloading_chunks", &state.unloading_by_chunk.len())
+            .finish()
+    }
+}
+
+impl WorldEntityManager {
+    /// Creates an empty manager.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: SyncRwLock::new(ManagerState::default()),
+        }
+    }
+
+    /// Returns whether runtime entity ownership for this chunk is loaded.
+    ///
+    /// This is Vanilla's separate `areEntitiesLoaded` gate used by block-entity
+    /// ticking; it is intentionally not the stricter entity-ticking visibility.
+    #[must_use]
+    pub(crate) fn is_chunk_loaded(&self, pos: ChunkPos) -> bool {
+        self.state.read().chunk_visibility.contains_key(&pos)
+    }
+
+    /// Marks a chunk as loaded and reactivates retained unloading entities.
+    pub fn on_chunk_loaded(&self, pos: ChunkPos) -> ChunkEntityLoadResult {
+        let mut state = self.state.write();
+        state
+            .chunk_visibility
+            .entry(pos)
+            .or_insert(EntityVisibility::Hidden);
+
+        let mut result = ChunkEntityLoadResult::default();
+        if let Some(entries) = state.unloading_by_chunk.remove(&pos) {
+            result.restored.reserve(entries.len());
+            for entry in entries {
+                if entry.entity.is_removed() {
+                    if entry.should_save() {
+                        result.needs_save = true;
+                        state
+                            .save_pending_by_chunk
+                            .entry(pos)
+                            .or_default()
+                            .push(entry);
+                    }
+                    continue;
+                }
+
+                let entity = Arc::clone(&entry.entity);
+                Self::insert_live_entry(&mut state, entry);
+                let lifecycle = Self::apply_entity_lifecycle_after_insert(&mut state, entity.id());
+                result.tracking_started.extend(lifecycle.tracking_started);
+                result.ticking_started.extend(lifecycle.ticking_started);
+                result.restored.push(entity);
+            }
+        }
+
+        result
+    }
+
+    /// Updates the entity visibility for a chunk column.
+    pub fn update_chunk_visibility(
+        &self,
+        pos: ChunkPos,
+        visibility: EntityVisibility,
+    ) -> EntityLifecycleChanges {
+        let mut state = self.state.write();
+        let previous = state
+            .chunk_visibility
+            .insert(pos, visibility)
+            .unwrap_or(EntityVisibility::Hidden);
+
+        if previous == visibility {
+            return EntityLifecycleChanges::default();
+        }
+
+        Self::apply_chunk_visibility_change(&mut state, pos, previous, visibility)
+    }
+
+    fn push_unique_entity(
+        entity: &SharedEntity,
+        seen: &mut FxHashSet<i32>,
+        entities: &mut Vec<SharedEntity>,
+    ) {
+        if seen.insert(entity.id()) {
+            entities.push(Arc::clone(entity));
+        }
+    }
+
+    /// Moves manager-owned root entities in `pos` out of live world membership while
+    /// retaining them for possible chunk recovery.
+    pub fn begin_chunk_unload(&self, pos: ChunkPos) -> ChunkEntityUnloadStart {
+        let mut state = self.state.write();
+        let previous_visibility = state
+            .chunk_visibility
+            .remove(&pos)
+            .unwrap_or(EntityVisibility::Hidden);
+
+        let ids = Self::entity_ids_in_chunk_order(&state, pos);
+
+        let mut result = ChunkEntityUnloadStart::default();
+        let lifecycle = Self::apply_chunk_visibility_change(
+            &mut state,
+            pos,
+            previous_visibility,
+            EntityVisibility::Hidden,
+        );
+        let mut tracking_stopped_ids = lifecycle
+            .tracking_stopped
+            .iter()
+            .map(|entity| entity.id())
+            .collect::<FxHashSet<_>>();
+        result.tracking_stopped = lifecycle.tracking_stopped;
+        result.ticking_stopped = lifecycle.ticking_stopped;
+
+        let mut root_ids = Vec::new();
+
+        for entity_id in ids {
+            let Some(entry) = state.live_by_id.get(entity_id) else {
+                continue;
+            };
+            if entry.ownership != EntityOwnership::ManagerOwned {
+                continue;
+            }
+
+            Self::push_unique_entity(
+                &entry.entity,
+                &mut tracking_stopped_ids,
+                &mut result.tracking_stopped,
+            );
+            if !entry.entity.is_passenger() {
+                root_ids.push(entity_id);
+            }
+        }
+
+        let mut retained = Vec::new();
+        let mut visited = FxHashSet::default();
+        for entity_id in root_ids {
+            Self::retain_unloading_entity_tree(
+                &mut state,
+                entity_id,
+                &mut visited,
+                &mut retained,
+                &mut result.retained,
+                &mut tracking_stopped_ids,
+                &mut result.tracking_stopped,
+            );
+        }
+
+        if !retained.is_empty() {
+            state
+                .unloading_by_chunk
+                .entry(pos)
+                .or_default()
+                .extend(retained);
+        }
+
+        result
+    }
+
+    fn retain_unloading_entity_tree(
+        state: &mut ManagerState,
+        entity_id: i32,
+        visited: &mut FxHashSet<i32>,
+        retained: &mut Vec<EntityEntry>,
+        retained_entities: &mut Vec<SharedEntity>,
+        tracking_stopped_ids: &mut FxHashSet<i32>,
+        tracking_stopped: &mut Vec<SharedEntity>,
+    ) {
+        if !visited.insert(entity_id) {
+            return;
+        }
+
+        let Some(entry) = Self::remove_live_entry(state, entity_id) else {
+            return;
+        };
+
+        if entry.ownership != EntityOwnership::ManagerOwned {
+            let restored_id = entry.entity.id();
+            Self::insert_live_entry(state, entry);
+
+            let entity_to_tick = state.live_by_id.get(restored_id).and_then(|entry| {
+                let visibility = Self::lifecycle_visibility_for(
+                    entry,
+                    Self::chunk_visibility(state, entry.chunk),
+                );
+                visibility.is_ticking().then(|| Arc::clone(&entry.entity))
+            });
+
+            if let Some(entity) = entity_to_tick {
+                state.tick_list.add(&entity);
+            }
+
+            return;
+        }
+
+        let passengers = entry.entity.passengers();
+        Self::push_unique_entity(&entry.entity, tracking_stopped_ids, tracking_stopped);
+        retained_entities.push(Arc::clone(&entry.entity));
+        retained.push(entry);
+        for passenger in passengers {
+            Self::retain_unloading_entity_tree(
+                state,
+                passenger.id(),
+                visited,
+                retained,
+                retained_entities,
+                tracking_stopped_ids,
+                tracking_stopped,
+            );
+        }
+    }
+
+    /// Finalizes an unloading chunk. Retained entities are detached and dropped.
+    pub fn finalize_chunk_unload(&self, pos: ChunkPos) {
+        let entries = self
+            .state
+            .write()
+            .unloading_by_chunk
+            .remove(&pos)
+            .unwrap_or_default();
+
+        for entry in entries {
+            entry
+                .entity
+                .set_level_callback(Arc::new(NullEntityCallback));
+            entry.entity.set_removed(RemovalReason::UnloadedToChunk);
+        }
+    }
+
+    /// Registers a live runtime entity.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an entity with the same session network ID is already present. Duplicate runtime
+    /// IDs indicate corrupted manager ownership and cannot be recovered without losing identity.
+    pub fn add_live_entity(
+        &self,
+        entity: SharedEntity,
+        ownership: EntityOwnership,
+    ) -> Result<EntityLifecycleChanges, AddEntityError> {
+        let entry = Self::checked_live_entry(entity, ownership)?;
+        let entity_id = entry.entity.id();
+        let mut state = self.state.write();
+        assert!(
+            !Self::contains_id(&state, entity_id),
+            "entity id {entity_id} is already registered in the world entity manager"
+        );
+        Self::validate_live_entries(&state, slice::from_ref(&entry), ownership, true)?;
+        Self::insert_live_entry(&mut state, entry);
+        Ok(Self::apply_entity_lifecycle_after_insert(
+            &mut state, entity_id,
+        ))
+    }
+
+    /// Adds a related group of live entities atomically.
+    ///
+    /// Use this for persisted vehicle/passenger trees so registration either
+    /// publishes the whole tree or leaves world indexes unchanged.
+    ///
+    pub fn add_live_entity_tree(
+        &self,
+        entities: &[SharedEntity],
+        ownership: EntityOwnership,
+    ) -> Result<EntityLifecycleChanges, AddEntityError> {
+        let mut entries = Vec::with_capacity(entities.len());
+        for entity in entities {
+            entries.push(Self::checked_live_entry(Arc::clone(entity), ownership)?);
+        }
+
+        let mut seen_ids = FxHashSet::default();
+        let mut seen_uuids = FxHashSet::default();
+        for entry in &entries {
+            let entity_id = entry.entity.id();
+            if !seen_ids.insert(entity_id) {
+                return Err(AddEntityError::DuplicateId { entity_id });
+            }
+            if !seen_uuids.insert(entry.uuid) {
+                return Err(AddEntityError::DuplicateUuid {
+                    entity_id,
+                    uuid: entry.uuid,
+                });
+            }
+        }
+
+        let mut state = self.state.write();
+        Self::validate_live_entries(&state, &entries, ownership, false)?;
+        let entity_ids = entries
+            .iter()
+            .map(|entry| entry.entity.id())
+            .collect::<Vec<_>>();
+        for entry in entries {
+            Self::insert_live_entry(&mut state, entry);
+        }
+        let mut lifecycle = EntityLifecycleChanges::default();
+        for entity_id in entity_ids {
+            lifecycle.extend(Self::apply_entity_lifecycle_after_insert(
+                &mut state, entity_id,
+            ));
+        }
+        Ok(lifecycle)
+    }
+
+    fn checked_live_entry(
+        entity: SharedEntity,
+        ownership: EntityOwnership,
+    ) -> Result<EntityEntry, AddEntityError> {
+        if entity.is_removed() {
+            return Err(AddEntityError::RemovedEntity {
+                entity_id: entity.id(),
+            });
+        }
+
+        Ok(EntityEntry::new(entity, ownership))
+    }
+
+    fn validate_live_entries(
+        state: &ManagerState,
+        entries: &[EntityEntry],
+        ownership: EntityOwnership,
+        require_loaded_chunks: bool,
+    ) -> Result<(), AddEntityError> {
+        for entry in entries {
+            let entity_id = entry.entity.id();
+            if Self::contains_id(state, entity_id) {
+                return Err(AddEntityError::DuplicateId { entity_id });
+            }
+            if Self::contains_uuid(state, entry.uuid) {
+                return Err(AddEntityError::DuplicateUuid {
+                    entity_id,
+                    uuid: entry.uuid,
+                });
+            }
+            if require_loaded_chunks
+                && ownership == EntityOwnership::ManagerOwned
+                && !state.chunk_visibility.contains_key(&entry.chunk)
+            {
+                return Err(AddEntityError::ChunkNotLoaded {
+                    entity_id,
+                    chunk: entry.chunk,
+                });
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes a live entity for an explicit entity removal reason.
+    pub fn remove_live_entity(
+        &self,
+        entity_id: i32,
+        reason: RemovalReason,
+    ) -> Option<SharedEntity> {
+        let mut state = self.state.write();
+        let entry = Self::remove_live_entry(&mut state, entity_id)?;
+        let entity = Arc::clone(&entry.entity);
+
+        if reason.should_save() && entry.should_save() {
+            state
+                .save_pending_by_chunk
+                .entry(entry.chunk)
+                .or_default()
+                .push(entry);
+        }
+
+        Some(entity)
+    }
+
+    /// Acknowledges that selected save-pending entities for `chunk` were persisted.
+    pub fn on_chunk_saved(&self, chunk: ChunkPos, saved_entity_ids: &[i32]) {
+        if saved_entity_ids.is_empty() {
+            return;
+        }
+
+        let saved_entity_ids = saved_entity_ids.iter().copied().collect::<FxHashSet<_>>();
+        let mut state = self.state.write();
+        let Some(entries) = state.save_pending_by_chunk.get_mut(&chunk) else {
+            return;
+        };
+
+        entries.retain(|entry| !saved_entity_ids.contains(&entry.entity.id()));
+        if entries.is_empty() {
+            state.save_pending_by_chunk.remove(&chunk);
+        }
+    }
+
+    /// Returns whether `chunk` has removed runtime entities waiting for a save acknowledgement.
+    #[must_use]
+    pub fn has_save_pending_for_chunk(&self, chunk: ChunkPos) -> bool {
+        self.state
+            .read()
+            .save_pending_by_chunk
+            .get(&chunk)
+            .is_some_and(|entries| !entries.is_empty())
+    }
+
+    /// Validates that a live entity can move to `new_pos`.
+    pub fn validate_move(&self, entity_id: i32, new_pos: DVec3) -> Result<(), EntityMoveError> {
+        let state = self.state.read();
+
+        let Some(entry) = state.live_by_id.get(entity_id) else {
+            return Err(EntityMoveError::NotLive { entity_id });
+        };
+
+        if entry.ownership == EntityOwnership::ManagerOwned {
+            let new_section = SectionPos::from_entity_pos(new_pos);
+            let new_chunk = ChunkPos::new(new_section.x(), new_section.z());
+            if !Self::can_move_manager_owned_to_chunk(&state, entry, new_chunk) {
+                return Err(EntityMoveError::UnloadedDestination {
+                    entity_id,
+                    chunk: new_chunk,
+                });
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Commits manager indexes after a live entity position change.
+    #[expect(
+        clippy::too_many_lines,
+        reason = "keeps movement index updates atomic under one manager write lock"
+    )]
+    pub fn commit_move(
+        &self,
+        entity_id: i32,
+        new_pos: DVec3,
+    ) -> Result<EntityMoveUpdate, EntityMoveError> {
+        let mut state = self.state.write();
+
+        let Some(current) = state.live_by_id.get(entity_id) else {
+            return Err(EntityMoveError::NotLive { entity_id });
+        };
+
+        let new_section = SectionPos::from_entity_pos(new_pos);
+        let new_chunk = ChunkPos::new(new_section.x(), new_section.z());
+
+        if current.ownership == EntityOwnership::ManagerOwned
+            && !Self::can_move_manager_owned_to_chunk(&state, current, new_chunk)
+        {
+            return Err(EntityMoveError::UnloadedDestination {
+                entity_id,
+                chunk: new_chunk,
+            });
+        }
+
+        let old_section = current.section;
+        let old_chunk = current.chunk;
+        let old_accessible = Self::is_accessible(&state, current);
+        let new_accessible = Self::is_accessible_at(&state, current.ownership, new_chunk);
+        let old_visibility =
+            Self::lifecycle_visibility_for(current, Self::chunk_visibility(&state, old_chunk));
+        let new_visibility =
+            Self::lifecycle_visibility_for(current, Self::chunk_visibility(&state, new_chunk));
+        let old_ticking = old_visibility.is_ticking();
+        let new_ticking = new_visibility.is_ticking();
+
+        let new_bounding_box = current.entity.bounding_box();
+        let new_spatial_cells = EntitySpatialCellBounds::from_aabb(&new_bounding_box).cells();
+        let spatial_cells_changed = current.spatial_cells != new_spatial_cells;
+        let section_changed = old_section != new_section;
+        let spatial_index_changed = spatial_cells_changed || section_changed;
+        let current_section_order = current.query_order.insertion;
+        let hard_collision_relevant = current.hard_collision_relevant;
+
+        let Some(entity_slot) = state.live_by_id.slot(entity_id) else {
+            return Err(EntityMoveError::NotLive { entity_id });
+        };
+
+        if !section_changed && !spatial_cells_changed {
+            if let Some(entry) = state.live_by_id.get_mut(entity_id) {
+                entry.bounding_box = new_bounding_box;
+            }
+
+            return Ok(EntityMoveUpdate {
+                entity_id,
+                old_section,
+                new_section,
+                old_chunk,
+                new_chunk,
+                old_accessible,
+                new_accessible,
+                old_ticking,
+                new_ticking,
+            });
+        }
+
+        // A new section changes the query order, so every cell has to be re-sorted.
+        let retained = if section_changed {
+            RetainedSpatialCells::NONE
+        } else {
+            RetainedSpatialCells::between(&current.spatial_cells, &new_spatial_cells)
+        };
+
+        if section_changed {
+            Self::remove_from_section(&mut state, old_section, entity_id);
+            Self::remove_from_chunk(&mut state, old_chunk, entity_id);
+        }
+
+        let new_section_order = if section_changed {
+            Self::next_section_order(&mut state)
+        } else {
+            current_section_order
+        };
+
+        if spatial_index_changed {
+            let Some(entry) = state.live_by_id.get_mut(entity_id) else {
+                return Err(EntityMoveError::NotLive { entity_id });
+            };
+
+            let previous_cells = mem::take(&mut entry.spatial_cells);
+            Self::remove_from_spatial_indexes(
+                &mut state,
+                &previous_cells,
+                entity_slot,
+                hard_collision_relevant,
+                retained.current,
+            );
+        }
+
+        if let Some(entry) = state.live_by_id.get_mut(entity_id) {
+            entry.section = new_section;
+            entry.chunk = new_chunk;
+            entry.bounding_box = new_bounding_box;
+            entry.accessible = new_accessible;
+
+            if spatial_index_changed {
+                entry.spatial_cells = new_spatial_cells;
+            }
+
+            if section_changed {
+                entry.query_order = EntityQueryOrder {
+                    section: PackedSectionPos::from(new_section),
+                    insertion: new_section_order,
+                };
+            }
+        }
+
+        if spatial_index_changed {
+            Self::insert_into_spatial_indexes(
+                &mut state,
+                entity_slot,
+                hard_collision_relevant,
+                retained.previous,
+            );
+        }
+
+        if section_changed {
+            state
+                .by_section
+                .entry(PackedSectionPos::from(new_section))
+                .or_default()
+                .insert(entity_id);
+            state
+                .by_chunk
+                .entry(new_chunk)
+                .or_default()
+                .insert(entity_id);
+        }
+
+        if old_accessible && !new_accessible {
+            state.accessible_order.remove(entity_id);
+        } else if !old_accessible && new_accessible {
+            state.accessible_order.insert(entity_id);
+        }
+
+        if old_ticking && !new_ticking {
+            state.tick_list.remove(entity_id);
+        } else if !old_ticking && new_ticking {
+            let ManagerState {
+                live_by_id,
+                tick_list,
+                ..
+            } = &mut *state;
+
+            if let Some(entry) = live_by_id.get(entity_id) {
+                tick_list.add(&entry.entity);
+            }
+        }
+
+        Ok(EntityMoveUpdate {
+            entity_id,
+            old_section,
+            new_section,
+            old_chunk,
+            new_chunk,
+            old_accessible,
+            new_accessible,
+            old_ticking,
+            new_ticking,
+        })
+    }
+
+    /// Commits a live entity bounding-box change to the spatial query index.
+    ///
+    /// Reads the current bounds after acquiring the manager lock so concurrent
+    /// callbacks may complete in either order without restoring stale bounds.
+    pub fn commit_bounding_box_change(&self, entity_id: i32) {
+        let mut state = self.state.write();
+
+        let Some(current) = state.live_by_id.get(entity_id) else {
+            return;
+        };
+
+        let bounding_box = current.entity.bounding_box();
+        let new_spatial_cells = EntitySpatialCellBounds::from_aabb(&bounding_box).cells();
+        let hard_collision_relevant = current.hard_collision_relevant;
+
+        if current.spatial_cells == new_spatial_cells {
+            if let Some(entry) = state.live_by_id.get_mut(entity_id) {
+                entry.bounding_box = bounding_box;
+            }
+
+            return;
+        }
+
+        let retained = RetainedSpatialCells::between(&current.spatial_cells, &new_spatial_cells);
+
+        let Some(entry) = state.live_by_id.get_mut(entity_id) else {
+            return;
+        };
+
+        let previous_cells = mem::take(&mut entry.spatial_cells);
+
+        let Some(entity_slot) = state.live_by_id.slot(entity_id) else {
+            return;
+        };
+
+        Self::remove_from_spatial_indexes(
+            &mut state,
+            &previous_cells,
+            entity_slot,
+            hard_collision_relevant,
+            retained.current,
+        );
+
+        if let Some(entry) = state.live_by_id.get_mut(entity_id) {
+            entry.bounding_box = bounding_box;
+            entry.spatial_cells = new_spatial_cells;
+        }
+
+        Self::insert_into_spatial_indexes(
+            &mut state,
+            entity_slot,
+            hard_collision_relevant,
+            retained.previous,
+        );
+    }
+
+    fn can_move_manager_owned_to_chunk(
+        state: &ManagerState,
+        entry: &EntityEntry,
+        new_chunk: ChunkPos,
+    ) -> bool {
+        state.chunk_visibility.contains_key(&new_chunk)
+            || (entry.entity.is_passenger()
+                && Self::has_live_loaded_root_vehicle(state, &entry.entity))
+    }
+
+    fn has_live_loaded_root_vehicle(state: &ManagerState, entity: &SharedEntity) -> bool {
+        let mut visited = FxHashSet::default();
+        visited.insert(entity.id());
+
+        let mut passenger = Arc::clone(entity);
+        let Some(mut vehicle) = passenger.vehicle() else {
+            return false;
+        };
+
+        loop {
+            assert!(
+                visited.insert(vehicle.id()),
+                "cyclic passenger relationship involving entity {}",
+                entity.id()
+            );
+            if vehicle.is_removed() || !vehicle.has_passenger(passenger.as_ref()) {
+                return false;
+            }
+
+            let Some(vehicle_entry) = state.live_by_id.get(vehicle.id()) else {
+                return false;
+            };
+
+            let Some(next_vehicle) = vehicle.vehicle() else {
+                return match vehicle_entry.ownership {
+                    EntityOwnership::External => true,
+                    EntityOwnership::ManagerOwned => {
+                        state.chunk_visibility.contains_key(&vehicle_entry.chunk)
+                    }
+                };
+            };
+
+            passenger = vehicle;
+            vehicle = next_vehicle;
+        }
+    }
+
+    #[must_use]
+    /// Gets a live entity by session network ID.
+    pub fn get_by_id(&self, entity_id: i32) -> Option<SharedEntity> {
+        self.state
+            .read()
+            .live_by_id
+            .get(entity_id)
+            .map(|entry| Arc::clone(&entry.entity))
+    }
+
+    /// Returns true if this exact entity is live or retained for chunk-unload recovery.
+    pub fn contains_live_or_unloading_entity(&self, entity: &SharedEntity) -> bool {
+        let state = self.state.read();
+        state
+            .live_by_id
+            .get(entity.id())
+            .is_some_and(|entry| Arc::ptr_eq(&entry.entity, entity))
+            || state
+                .unloading_by_chunk
+                .values()
+                .flatten()
+                .any(|entry| Arc::ptr_eq(&entry.entity, entity))
+    }
+
+    #[must_use]
+    /// Gets a live entity by session network ID if it is visible to vanilla gameplay lookups.
+    pub fn get_accessible_by_id(&self, entity_id: i32) -> Option<SharedEntity> {
+        let state = self.state.read();
+        let entry = state.live_by_id.get(entity_id)?;
+        entry.accessible.then(|| Arc::clone(&entry.entity))
+    }
+
+    #[must_use]
+    /// Gets a live entity by persistent UUID.
+    pub fn get_by_uuid(&self, uuid: &Uuid) -> Option<SharedEntity> {
+        let state = self.state.read();
+        let entity_id = state.live_by_uuid.get(uuid)?;
+        state
+            .live_by_id
+            .get(*entity_id)
+            .map(|entry| Arc::clone(&entry.entity))
+    }
+
+    #[must_use]
+    /// Gets live entities whose bounding boxes intersect `aabb` and match `predicate`.
+    pub fn get_entities_in_aabb_matching(
+        &self,
+        aabb: &WorldAabb,
+        mut predicate: impl FnMut(&dyn Entity) -> bool,
+    ) -> Vec<SharedEntity> {
+        self.get_entities_in_aabb(aabb)
+            .into_iter()
+            .filter(|entity| predicate(entity.as_ref()))
+            .collect()
+    }
+
+    /// Returns whether any live entity intersects `aabb` and matches `predicate`.
+    #[must_use]
+    pub fn has_entity_in_aabb_matching(
+        &self,
+        aabb: &WorldAabb,
+        mut predicate: impl FnMut(&dyn Entity) -> bool,
+    ) -> bool {
+        let state = self.state.read();
+
+        for entry in Self::entity_query_entries(&state, aabb) {
+            if entry.accessible && predicate(entry.entity.as_ref()) {
+                return true;
+            }
+        }
+
+        false
+    }
+
+    /// Gets matching live entity bounding boxes that intersect `aabb`.
+    #[must_use]
+    pub fn get_entity_bounding_boxes_in_aabb_matching(
+        &self,
+        aabb: &WorldAabb,
+        mut predicate: impl FnMut(&dyn Entity) -> bool,
+    ) -> Vec<WorldAabb> {
+        let state = self.state.read();
+        let mut result = Vec::new();
+
+        for entry in Self::entity_query_entries(&state, aabb) {
+            if entry.accessible && predicate(entry.entity.as_ref()) {
+                result.push(entry.bounding_box);
+            }
+        }
+
+        result
+    }
+
+    /// Gets movement-collision bounding boxes from the selected conservative broad phase.
+    ///
+    /// Entity callbacks run after the manager read lock is released. This permits plugin-defined
+    /// collision rules to perform ordinary entity-manager lookups without lock reentrancy.
+    #[must_use]
+    pub(crate) fn get_movement_collision_boxes_in_aabb_matching(
+        &self,
+        aabb: &WorldAabb,
+        candidates: EntityCollisionCandidates,
+        mut predicate: impl FnMut(&dyn Entity) -> bool,
+    ) -> Vec<WorldAabb> {
+        let colliding_entities = self
+            .movement_collision_candidate_snapshot(aabb, candidates)
+            .into_iter()
+            .filter(|entity| entity.bounding_box().intersects(*aabb) && predicate(entity.as_ref()))
+            .collect::<SmallVec<[SharedEntity; 8]>>();
+
+        // Vanilla first completes `getEntities`, including every selector callback, and only then
+        // reads the accepted entities' boxes. Keep those phases separate so a plugin callback that
+        // moves an entity cannot leave a stale collision shape in the result.
+        colliding_entities
+            .into_iter()
+            .map(|entity| entity.bounding_box())
+            .collect()
+    }
+
+    /// Returns whether a movement-collision candidate matches after the broad phase.
+    #[must_use]
+    pub(crate) fn has_movement_collision_in_aabb_matching(
+        &self,
+        aabb: &WorldAabb,
+        candidates: EntityCollisionCandidates,
+        mut predicate: impl FnMut(&dyn Entity) -> bool,
+    ) -> bool {
+        self.movement_collision_candidate_snapshot(aabb, candidates)
+            .into_iter()
+            .any(|entity| entity.bounding_box().intersects(*aabb) && predicate(entity.as_ref()))
+    }
+
+    fn movement_collision_candidate_snapshot(
+        &self,
+        aabb: &WorldAabb,
+        candidates: EntityCollisionCandidates,
+    ) -> SmallVec<[SharedEntity; 8]> {
+        let state = self.state.read();
+        let mut snapshot = SmallVec::new();
+
+        Self::query_entries(&state, aabb, candidates, None).for_each(|entry| {
+            if entry.accessible {
+                snapshot.push(Arc::clone(&entry.entity));
+            }
+        });
+
+        snapshot
+    }
+
+    #[must_use]
+    /// Gets the nearest live entity whose bounding box intersects `aabb` and matches `predicate`.
+    pub fn nearest_entity_in_aabb_matching(
+        &self,
+        aabb: &WorldAabb,
+        origin: DVec3,
+        mut predicate: impl FnMut(&dyn Entity) -> bool,
+    ) -> Option<SharedEntity> {
+        self.get_entities_in_aabb(aabb)
+            .into_iter()
+            .filter(|entity| predicate(entity.as_ref()))
+            .min_by(|first, second| {
+                first
+                    .position()
+                    .distance_squared(origin)
+                    .total_cmp(&second.position().distance_squared(origin))
+            })
+    }
+
+    #[must_use]
+    /// Gets live entities whose bounding boxes intersect `aabb`.
+    pub fn get_entities_in_aabb(&self, aabb: &WorldAabb) -> Vec<SharedEntity> {
+        let state = self.state.read();
+        let mut result = Vec::new();
+
+        Self::entity_query_entries(&state, aabb).for_each(|entry| {
+            if entry.accessible {
+                result.push(Arc::clone(&entry.entity));
+            }
+        });
+
+        result
+    }
+
+    /// Runs `action` on the ordered hits borrowed under the read lock, returning `None` when
+    /// it handled them. Returns the hits as owned entities when `action` declines or more
+    /// than `borrow_limit` entities match.
+    /// `action` must not re-enter the manager or write spatial or lifecycle state.
+    pub(crate) fn try_with_entities_in_aabb(
+        &self,
+        aabb: &WorldAabb,
+        borrow_limit: Option<usize>,
+        action: impl FnOnce(&[&SharedEntity]) -> bool,
+    ) -> Option<Vec<SharedEntity>> {
+        let state = self.state.read();
+        let mut entries = Self::entity_query_entries(&state, aabb).filter(|entry| entry.accessible);
+        let mut entities = SmallVec::<[&SharedEntity; INLINE_QUERY_CAPACITY]>::new();
+
+        if let Some(limit) = borrow_limit {
+            entries
+                .by_ref()
+                .take(limit)
+                .for_each(|entry| entities.push(&entry.entity));
+
+            if let Some(next) = entries.next() {
+                let mut snapshot = Vec::with_capacity(entities.capacity());
+                snapshot.extend(entities.iter().map(|entity| Arc::clone(entity)));
+                snapshot.push(Arc::clone(&next.entity));
+                entries.for_each(|entry| snapshot.push(Arc::clone(&entry.entity)));
+
+                return Some(snapshot);
+            }
+        } else {
+            entries.for_each(|entry| entities.push(&entry.entity));
+        }
+
+        if action(&entities) {
+            None
+        } else {
+            Some(entities.into_iter().map(Arc::clone).collect())
+        }
+    }
+
+    /// Gets all live entities visible to vanilla gameplay lookups.
+    #[must_use]
+    pub fn get_accessible_entities(&self) -> Vec<SharedEntity> {
+        let state = self.state.read();
+        state
+            .accessible_order
+            .iter()
+            .filter_map(|entity_id| state.live_by_id.get(*entity_id))
+            .filter(|entry| entry.accessible)
+            .map(|entry| Arc::clone(&entry.entity))
+            .collect()
+    }
+
+    fn entity_query_entries<'a>(
+        state: &'a ManagerState,
+        aabb: &WorldAabb,
+    ) -> EntityQueryEntries<'a> {
+        Self::query_entries(state, aabb, EntityCollisionCandidates::All, Some(aabb))
+    }
+
+    fn query_entries<'a>(
+        state: &'a ManagerState,
+        aabb: &WorldAabb,
+        candidates: EntityCollisionCandidates,
+        entry_bounds: Option<&WorldAabb>,
+    ) -> EntityQueryEntries<'a> {
+        let spatial_index = match candidates {
+            EntityCollisionCandidates::All => &state.by_spatial_cell,
+            EntityCollisionCandidates::HardCollisionRelevant => &state.by_hard_collision_cell,
+        };
+
+        let bounds = EntitySpatialCellBounds::from_aabb(aabb);
+        let mut populated_cells = SmallVec::new();
+        let direct_probe_limit =
+            MAX_DIRECT_SPATIAL_CELL_PROBES.min(spatial_index.capacity() as i128);
+
+        if bounds.direct_probe_count() <= direct_probe_limit {
+            for x in bounds.minimum.x..=bounds.maximum.x {
+                for y in bounds.minimum.y..=bounds.maximum.y {
+                    for z in bounds.minimum.z..=bounds.maximum.z {
+                        if let Some(cell) = spatial_index.get(&EntitySpatialCell { x, y, z }) {
+                            populated_cells.push(cell.entities.as_slice());
+                        }
+                    }
+                }
+            }
+        } else {
+            for (cell, entries) in spatial_index {
+                if bounds.contains(*cell) {
+                    populated_cells.push(entries.entities.as_slice());
+                }
+            }
+        }
+
+        EntityQueryEntries::new(state, entry_bounds, populated_cells)
+    }
+
+    fn entity_ids_in_chunk_order(state: &ManagerState, chunk: ChunkPos) -> Vec<i32> {
+        let first = PackedSectionPos::from(SectionPos::new(chunk.0.x, 0, chunk.0.y));
+        let last = PackedSectionPos::from(SectionPos::new(chunk.0.x, -1, chunk.0.y));
+        state
+            .by_section
+            .range(first..=last)
+            .flat_map(|(_, entity_ids)| entity_ids.iter().copied())
+            .collect()
+    }
+
+    /// Reports saveable entities whose chunks were not part of a chunk save pass.
+    #[must_use]
+    pub fn saveable_entities_outside_chunks(
+        &self,
+        saved_chunks: &[ChunkPos],
+    ) -> Vec<UnsavedEntityReport> {
+        let saved_chunks = saved_chunks.iter().copied().collect::<FxHashSet<_>>();
+        let state = self.state.read();
+        let mut seen = FxHashSet::default();
+        let mut reports = Vec::new();
+
+        for entry in state.live_by_id.values() {
+            Self::push_unsaved_entity_report(&saved_chunks, &mut seen, &mut reports, entry);
+        }
+
+        for entries in state.unloading_by_chunk.values() {
+            for entry in entries {
+                Self::push_unsaved_entity_report(&saved_chunks, &mut seen, &mut reports, entry);
+            }
+        }
+
+        for entries in state.save_pending_by_chunk.values() {
+            for entry in entries {
+                Self::push_unsaved_entity_report(&saved_chunks, &mut seen, &mut reports, entry);
+            }
+        }
+
+        reports.sort_by_key(|report| (report.chunk.0.x, report.chunk.0.y, report.entity_id));
+        reports
+    }
+
+    #[must_use]
+    /// Gets entities that should be serialized for `chunk`.
+    pub fn get_saveable_entities_for_chunk(&self, chunk: ChunkPos) -> Vec<SharedEntity> {
+        let state = self.state.read();
+        let mut result = Vec::new();
+        let mut seen_ids = FxHashSet::default();
+        let mut seen_uuids = FxHashSet::default();
+
+        for entity_id in Self::entity_ids_in_chunk_order(&state, chunk) {
+            let Some(entry) = state.live_by_id.get(entity_id) else {
+                continue;
+            };
+            Self::push_saveable_entity(&mut result, &mut seen_ids, &mut seen_uuids, entry);
+        }
+
+        if let Some(entries) = state.unloading_by_chunk.get(&chunk) {
+            for entry in entries {
+                Self::push_saveable_entity(&mut result, &mut seen_ids, &mut seen_uuids, entry);
+            }
+        }
+
+        if let Some(entries) = state.save_pending_by_chunk.get(&chunk) {
+            for entry in entries {
+                Self::push_saveable_entity(&mut result, &mut seen_ids, &mut seen_uuids, entry);
+            }
+        }
+
+        result
+    }
+
+    #[must_use]
+    /// Gets live entities currently indexed in `chunk`.
+    pub fn live_entities_in_chunk(&self, chunk: ChunkPos) -> Vec<SharedEntity> {
+        let state = self.state.read();
+        Self::entity_ids_in_chunk_order(&state, chunk)
+            .into_iter()
+            .filter_map(|entity_id| state.live_by_id.get(entity_id))
+            .map(|entry| Arc::clone(&entry.entity))
+            .collect()
+    }
+
+    #[must_use]
+    /// Returns the number of live indexed entities.
+    pub fn count(&self) -> usize {
+        self.state.read().live_by_id.len()
+    }
+
+    /// Ticks live entities currently in the ticking visibility set.
+    pub fn tick_entities(&self, _tick_count: i32, runs_normally: bool) -> FxHashSet<ChunkPos> {
+        let mut dirty_chunks = FxHashSet::default();
+        let tick_candidates = self.ticking_entities_snapshot();
+        for entity in tick_candidates {
+            let Some(tick_context) = self.tick_context(entity.id()) else {
+                continue;
+            };
+
+            if entity.is_removed() {
+                continue;
+            }
+
+            if Self::is_entity_frozen_by_tick_rate(entity.as_ref(), runs_normally) {
+                continue;
+            }
+
+            let entity_chunk = tick_context.manager_chunk;
+            entity.check_despawn();
+            if entity.is_removed() {
+                if let Some(chunk) = entity_chunk {
+                    dirty_chunks.insert(chunk);
+                }
+                continue;
+            }
+
+            if Self::is_valid_passenger_or_stop_riding(&entity) {
+                continue;
+            }
+
+            // Vanilla deliberately has no same-tick de-duplication here. A relationship change
+            // may make an entity tick once as a passenger and once from its later root-list slot.
+            self.tick_non_passenger(&entity, &mut dirty_chunks);
+        }
+        dirty_chunks
+    }
+
+    fn ticking_entities_snapshot(&self) -> Vec<SharedEntity> {
+        self.state.read().tick_list.snapshot()
+    }
+
+    fn live_manager_owned_entity_chunk(&self, entity_id: i32) -> Option<ChunkPos> {
+        self.state
+            .read()
+            .live_by_id
+            .get(entity_id)
+            .filter(|entry| entry.ownership == EntityOwnership::ManagerOwned)
+            .map(|entry| entry.chunk)
+    }
+
+    fn chunk_visibility(state: &ManagerState, chunk: ChunkPos) -> EntityVisibility {
+        state
+            .chunk_visibility
+            .get(&chunk)
+            .copied()
+            .unwrap_or(EntityVisibility::Hidden)
+    }
+
+    fn effective_visibility(
+        entry: &EntityEntry,
+        chunk_visibility: EntityVisibility,
+    ) -> EntityVisibility {
+        if entry.entity.is_always_ticking() {
+            return EntityVisibility::Ticking;
+        }
+        if entry.ownership == EntityOwnership::External {
+            return EntityVisibility::Tracked;
+        }
+        chunk_visibility
+    }
+
+    fn lifecycle_visibility_for(
+        entry: &EntityEntry,
+        chunk_visibility: EntityVisibility,
+    ) -> EntityVisibility {
+        Self::effective_visibility(entry, chunk_visibility)
+    }
+
+    fn apply_entity_lifecycle_after_insert(
+        state: &mut ManagerState,
+        entity_id: i32,
+    ) -> EntityLifecycleChanges {
+        let Some(entry) = state.live_by_id.get(entity_id) else {
+            return EntityLifecycleChanges::default();
+        };
+        let visibility =
+            Self::lifecycle_visibility_for(entry, Self::chunk_visibility(state, entry.chunk));
+        let entity = Arc::clone(&entry.entity);
+        let should_tick = visibility.is_ticking();
+
+        let mut lifecycle = EntityLifecycleChanges::default();
+        if visibility.is_accessible() {
+            lifecycle.tracking_started.push(Arc::clone(&entity));
+        }
+        if should_tick && state.tick_list.add(&entity) {
+            lifecycle.ticking_started.push(entity);
+        }
+        lifecycle
+    }
+
+    fn apply_chunk_visibility_change(
+        state: &mut ManagerState,
+        chunk: ChunkPos,
+        previous: EntityVisibility,
+        new: EntityVisibility,
+    ) -> EntityLifecycleChanges {
+        let entity_ids = Self::entity_ids_in_chunk_order(state, chunk);
+        let mut lifecycle = EntityLifecycleChanges::default();
+
+        for entity_id in entity_ids {
+            let Some(entry) = state.live_by_id.get_mut(entity_id) else {
+                continue;
+            };
+
+            entry.accessible = entry.ownership == EntityOwnership::External || new.is_accessible();
+
+            if entry.ownership != EntityOwnership::ManagerOwned {
+                continue;
+            }
+
+            let old_visibility = Self::lifecycle_visibility_for(entry, previous);
+            let new_visibility = Self::lifecycle_visibility_for(entry, new);
+            if old_visibility == new_visibility {
+                continue;
+            }
+
+            let entity = Arc::clone(&entry.entity);
+            if old_visibility.is_ticking()
+                && !new_visibility.is_ticking()
+                && state.tick_list.remove(entity_id).is_some()
+            {
+                lifecycle.ticking_stopped.push(Arc::clone(&entity));
+            }
+
+            if old_visibility.is_accessible() && !new_visibility.is_accessible() {
+                state.accessible_order.remove(entity_id);
+                lifecycle.tracking_stopped.push(Arc::clone(&entity));
+            } else if !old_visibility.is_accessible() && new_visibility.is_accessible() {
+                state.accessible_order.insert(entity_id);
+                lifecycle.tracking_started.push(Arc::clone(&entity));
+            }
+
+            if !old_visibility.is_ticking()
+                && new_visibility.is_ticking()
+                && state.tick_list.add(&entity)
+            {
+                lifecycle.ticking_started.push(entity);
+            }
+        }
+
+        lifecycle
+    }
+
+    fn is_entity_frozen_by_tick_rate(entity: &dyn Entity, runs_normally: bool) -> bool {
+        !runs_normally
+            && entity.entity_type() != &vanilla_entities::PLAYER
+            && entity.count_player_passengers() == 0
+    }
+
+    fn has_pending_world_change_in_vehicle_chain(entity: &SharedEntity) -> bool {
+        if entity.is_world_change_pending() {
+            return true;
+        }
+
+        let Some(mut vehicle) = entity.vehicle() else {
+            return false;
+        };
+
+        let mut visited = VehicleChain::new();
+        visited.push(entity.id());
+        loop {
+            assert!(
+                !visited.contains(&vehicle.id()),
+                "cyclic passenger relationship involving entity {}",
+                entity.id()
+            );
+            visited.push(vehicle.id());
+            if vehicle.is_world_change_pending() {
+                return true;
+            }
+            let Some(current) = vehicle.vehicle() else {
+                return false;
+            };
+            vehicle = current;
+        }
+    }
+
+    fn is_accessible(state: &ManagerState, entry: &EntityEntry) -> bool {
+        Self::is_accessible_at(state, entry.ownership, entry.chunk)
+    }
+
+    fn is_accessible_at(state: &ManagerState, ownership: EntityOwnership, chunk: ChunkPos) -> bool {
+        ownership == EntityOwnership::External
+            || Self::chunk_visibility(state, chunk).is_accessible()
+    }
+
+    fn is_valid_passenger_or_stop_riding(entity: &SharedEntity) -> bool {
+        let Some(vehicle) = entity.vehicle() else {
+            return false;
+        };
+
+        if !vehicle.is_removed() && vehicle.has_passenger(entity.as_ref()) {
+            Self::assert_acyclic_vehicle_chain(entity);
+            return true;
+        }
+
+        entity.stop_riding();
+        false
+    }
+
+    fn assert_acyclic_vehicle_chain(entity: &SharedEntity) {
+        let mut visited = VehicleChain::new();
+        visited.push(entity.id());
+
+        let mut vehicle = entity.vehicle();
+        while let Some(current) = vehicle {
+            assert!(
+                !visited.contains(&current.id()),
+                "cyclic passenger relationship involving entity {}",
+                entity.id()
+            );
+            visited.push(current.id());
+            vehicle = current.vehicle();
+        }
+    }
+
+    fn tick_non_passenger(&self, entity: &SharedEntity, dirty_chunks: &mut FxHashSet<ChunkPos>) {
+        snapshot_old_pos_and_rot_for_tick(entity.as_ref());
+        entity.advance_tick_count();
+        Arc::clone(entity).tick();
+        self.mark_dirty_after_tick(entity, dirty_chunks);
+        self.tick_vehicle_passengers(entity.as_ref(), dirty_chunks);
+    }
+
+    fn tick_vehicle_passengers(
+        &self,
+        vehicle: &dyn Entity,
+        dirty_chunks: &mut FxHashSet<ChunkPos>,
+    ) {
+        let mut post_tick = |entity: &SharedEntity| {
+            self.mark_dirty_after_tick(entity, dirty_chunks);
+        };
+        tick_vehicle_passengers_if(vehicle, &mut post_tick, &mut |entity| {
+            self.can_tick_entity_now(entity.id())
+        });
+    }
+
+    fn mark_dirty_after_tick(&self, entity: &SharedEntity, dirty_chunks: &mut FxHashSet<ChunkPos>) {
+        if self.live_manager_owned_entity_chunk(entity.id()).is_some() {
+            dirty_chunks.insert(ChunkPos::from_entity_pos(entity.position()));
+        }
+    }
+
+    fn can_tick_entity_now(&self, entity_id: i32) -> bool {
+        self.tick_context(entity_id).is_some()
+    }
+
+    fn tick_context(&self, entity_id: i32) -> Option<TickContext> {
+        let state = self.state.read();
+        let entry = state.live_by_id.get(entity_id)?;
+
+        if Self::has_pending_world_change_in_vehicle_chain(&entry.entity) {
+            return None;
+        }
+
+        let in_tick_list = state.tick_list.contains(entity_id);
+        let can_tick = match entry.ownership {
+            EntityOwnership::External => {
+                entry.entity.entity_type() == &vanilla_entities::PLAYER || in_tick_list
+            }
+            EntityOwnership::ManagerOwned => in_tick_list,
+        };
+        can_tick.then_some(TickContext {
+            manager_chunk: (entry.ownership == EntityOwnership::ManagerOwned)
+                .then_some(entry.chunk),
+        })
+    }
+
+    fn insert_live_entry(state: &mut ManagerState, mut entry: EntityEntry) {
+        let entity_id = entry.entity.id();
+        entry.bounding_box = entry.entity.bounding_box();
+        entry.spatial_cells = EntitySpatialCellBounds::from_aabb(&entry.bounding_box).cells();
+        let is_accessible = Self::is_accessible_at(state, entry.ownership, entry.chunk);
+        entry.accessible = is_accessible;
+        assert!(
+            !state.live_by_id.contains_key(entity_id),
+            "entity id {entity_id} is already registered in the world entity manager"
+        );
+        assert!(
+            state.live_by_uuid.insert(entry.uuid, entity_id).is_none(),
+            "entity uuid {} is already registered in the world entity manager",
+            entry.uuid
+        );
+        entry.query_order = EntityQueryOrder {
+            section: PackedSectionPos::from(entry.section),
+            insertion: Self::next_section_order(state),
+        };
+
+        state
+            .by_section
+            .entry(PackedSectionPos::from(entry.section))
+            .or_default()
+            .insert(entity_id);
+        state
+            .by_chunk
+            .entry(entry.chunk)
+            .or_default()
+            .insert(entity_id);
+        let hard_collision_relevant = entry.hard_collision_relevant;
+        let entity_slot = state.live_by_id.insert(entity_id, entry);
+        Self::insert_into_spatial_indexes(state, entity_slot, hard_collision_relevant, None);
+
+        if is_accessible {
+            state.accessible_order.insert(entity_id);
+        }
+    }
+
+    fn contains_uuid(state: &ManagerState, uuid: Uuid) -> bool {
+        state.live_by_uuid.contains_key(&uuid)
+            || state
+                .unloading_by_chunk
+                .values()
+                .flatten()
+                .any(|entry| entry.uuid == uuid)
+            || state
+                .save_pending_by_chunk
+                .values()
+                .flatten()
+                .any(|entry| entry.uuid == uuid)
+    }
+
+    fn contains_id(state: &ManagerState, entity_id: i32) -> bool {
+        state.live_by_id.contains_key(entity_id)
+            || state
+                .unloading_by_chunk
+                .values()
+                .flatten()
+                .any(|entry| entry.entity.id() == entity_id)
+            || state
+                .save_pending_by_chunk
+                .values()
+                .flatten()
+                .any(|entry| entry.entity.id() == entity_id)
+    }
+
+    fn push_saveable_entity(
+        result: &mut Vec<SharedEntity>,
+        seen_ids: &mut FxHashSet<i32>,
+        seen_uuids: &mut FxHashSet<Uuid>,
+        entry: &EntityEntry,
+    ) {
+        if !entry.should_save() || !seen_ids.insert(entry.entity.id()) {
+            return;
+        }
+        assert!(
+            seen_uuids.insert(entry.uuid),
+            "duplicate saveable entity uuid {} in world entity manager",
+            entry.uuid
+        );
+        result.push(Arc::clone(&entry.entity));
+    }
+
+    fn push_unsaved_entity_report(
+        saved_chunks: &FxHashSet<ChunkPos>,
+        seen: &mut FxHashSet<i32>,
+        reports: &mut Vec<UnsavedEntityReport>,
+        entry: &EntityEntry,
+    ) {
+        if saved_chunks.contains(&entry.chunk)
+            || !entry.should_save()
+            || !seen.insert(entry.entity.id())
+        {
+            return;
+        }
+
+        reports.push(UnsavedEntityReport {
+            entity_id: entry.entity.id(),
+            uuid: entry.uuid,
+            chunk: entry.chunk,
+        });
+    }
+
+    fn remove_live_entry(state: &mut ManagerState, entity_id: i32) -> Option<EntityEntry> {
+        let (entity_slot, entry) = state.live_by_id.remove(entity_id)?;
+        state.tick_list.remove(entity_id);
+        state.live_by_uuid.remove(&entry.uuid);
+        state.accessible_order.remove(entity_id);
+        Self::remove_from_section(state, entry.section, entity_id);
+        Self::remove_from_spatial_indexes(
+            state,
+            &entry.spatial_cells,
+            entity_slot,
+            entry.hard_collision_relevant,
+            None,
+        );
+
+        Self::remove_from_chunk(state, entry.chunk, entity_id);
+
+        Some(entry)
+    }
+
+    fn next_section_order(state: &mut ManagerState) -> u64 {
+        assert!(
+            state.next_section_order < u64::MAX,
+            "entity section insertion order exhausted"
+        );
+
+        let order = state.next_section_order;
+        state.next_section_order += 1;
+
+        order
+    }
+
+    /// Indexes `entity_slot` in every spatial index it belongs to, skipping cells inside `retained`.
+    fn insert_into_spatial_indexes(
+        state: &mut ManagerState,
+        entity_slot: EntitySlot,
+        hard_collision_relevant: bool,
+        retained: Option<EntitySpatialCellBounds>,
+    ) {
+        Self::insert_into_spatial_cells(
+            state,
+            entity_slot,
+            EntityCollisionCandidates::All,
+            retained,
+        );
+
+        if hard_collision_relevant {
+            Self::insert_into_spatial_cells(
+                state,
+                entity_slot,
+                EntityCollisionCandidates::HardCollisionRelevant,
+                retained,
+            );
+        }
+    }
+
+    /// Removes `entity_slot` from every spatial index it belongs to, keeping cells inside `retained`.
+    fn remove_from_spatial_indexes(
+        state: &mut ManagerState,
+        cells: &[EntitySpatialCell],
+        entity_slot: EntitySlot,
+        hard_collision_relevant: bool,
+        retained: Option<EntitySpatialCellBounds>,
+    ) {
+        Self::remove_from_spatial_cells(
+            state,
+            cells,
+            entity_slot,
+            EntityCollisionCandidates::All,
+            retained,
+        );
+
+        if hard_collision_relevant {
+            Self::remove_from_spatial_cells(
+                state,
+                cells,
+                entity_slot,
+                EntityCollisionCandidates::HardCollisionRelevant,
+                retained,
+            );
+        }
+    }
+
+    fn insert_into_spatial_cells(
+        state: &mut ManagerState,
+        entity_slot: EntitySlot,
+        candidates: EntityCollisionCandidates,
+        retained_bounds: Option<EntitySpatialCellBounds>,
+    ) {
+        match retained_bounds {
+            Some(bounds) => {
+                Self::insert_into_spatial_cells_matching(state, entity_slot, candidates, |cell| {
+                    !bounds.contains(cell)
+                });
+            }
+            None => {
+                Self::insert_into_spatial_cells_matching(state, entity_slot, candidates, |_| true);
+            }
+        }
+    }
+
+    fn insert_into_spatial_cells_matching(
+        state: &mut ManagerState,
+        entity_slot: EntitySlot,
+        candidates: EntityCollisionCandidates,
+        accept_cell: impl Fn(EntitySpatialCell) -> bool,
+    ) {
+        let entry = state.live_by_id.entry(entity_slot);
+        let query_order = entry.query_order;
+        let spatial_index = match candidates {
+            EntityCollisionCandidates::All => &mut state.by_spatial_cell,
+            EntityCollisionCandidates::HardCollisionRelevant => &mut state.by_hard_collision_cell,
+        };
+
+        for cell in &entry.spatial_cells {
+            if !accept_cell(*cell) {
+                continue;
+            }
+
+            let entries = spatial_index.entry(*cell).or_default();
+            let insertion_index = entries
+                .entities
+                .partition_point(|slot| state.live_by_id.entry(*slot).query_order < query_order);
+            entries.entities.insert(insertion_index, entity_slot);
+        }
+    }
+
+    fn remove_from_spatial_cells(
+        state: &mut ManagerState,
+        cells: &[EntitySpatialCell],
+        entity_slot: EntitySlot,
+        candidates: EntityCollisionCandidates,
+        retained_bounds: Option<EntitySpatialCellBounds>,
+    ) {
+        match retained_bounds {
+            Some(bounds) => Self::remove_from_spatial_cells_matching(
+                state,
+                cells,
+                entity_slot,
+                candidates,
+                |cell| !bounds.contains(cell),
+            ),
+            None => Self::remove_from_spatial_cells_matching(
+                state,
+                cells,
+                entity_slot,
+                candidates,
+                |_| true,
+            ),
+        }
+    }
+
+    fn remove_from_spatial_cells_matching(
+        state: &mut ManagerState,
+        cells: &[EntitySpatialCell],
+        entity_slot: EntitySlot,
+        candidates: EntityCollisionCandidates,
+        accept_cell: impl Fn(EntitySpatialCell) -> bool,
+    ) {
+        let spatial_index = match candidates {
+            EntityCollisionCandidates::All => &mut state.by_spatial_cell,
+            EntityCollisionCandidates::HardCollisionRelevant => &mut state.by_hard_collision_cell,
+        };
+
+        for cell in cells {
+            if !accept_cell(*cell) {
+                continue;
+            }
+
+            let remove_cell = if let Some(entries) = spatial_index.get_mut(cell) {
+                if let Some(index) = entries
+                    .entities
+                    .iter()
+                    .position(|slot| *slot == entity_slot)
+                {
+                    entries.entities.remove(index);
+                }
+
+                entries.entities.is_empty()
+            } else {
+                false
+            };
+
+            if remove_cell {
+                spatial_index.remove(cell);
+            }
+        }
+    }
+
+    fn remove_from_section(state: &mut ManagerState, section: SectionPos, entity_id: i32) {
+        let packed = PackedSectionPos::from(section);
+        let remove_section = if let Some(entity_ids) = state.by_section.get_mut(&packed) {
+            entity_ids.remove(entity_id);
+            entity_ids.is_empty()
+        } else {
+            false
+        };
+        if remove_section {
+            state.by_section.remove(&packed);
+        }
+    }
+
+    fn remove_from_chunk(state: &mut ManagerState, chunk: ChunkPos, entity_id: i32) {
+        let remove_chunk = if let Some(entity_ids) = state.by_chunk.get_mut(&chunk) {
+            entity_ids.remove(&entity_id);
+            entity_ids.is_empty()
+        } else {
+            false
+        };
+        if remove_chunk {
+            state.by_chunk.remove(&chunk);
+        }
+    }
+}
+
+impl Default for WorldEntityManager {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+mod entries;
+mod spatial_query;
+
+#[cfg(feature = "benchmark-support")]
+pub mod benchmark_support;
+
+#[cfg(test)]
+mod tests;

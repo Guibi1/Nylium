@@ -1,0 +1,58 @@
+//! Crafting table block behavior implementation.
+//!
+//! Opens the 3x3 crafting grid when right-clicked.
+
+use std::sync::Arc;
+
+use crate::behavior::InventoryAccess;
+use crate::behavior::block::BlockBehavior;
+use crate::behavior::context::{BlockHitResult, BlockPlaceContext, InteractionResult};
+use crate::inventory::menu::kinds::crafting;
+use crate::player::Player;
+use crate::world::World;
+use steel_macros::block_behavior;
+use steel_registry::blocks::BlockRef;
+use steel_registry::vanilla_custom_stats;
+use steel_utils::{BlockPos, BlockStateId, translations};
+use text_components::TextComponent;
+
+/// Behavior for the crafting table block.
+///
+/// When a player interacts with the crafting table without an item (or with
+/// an item that doesn't consume the action), it opens the 3x3 crafting menu.
+#[block_behavior]
+pub struct CraftingTableBlock {
+    block: BlockRef,
+}
+
+impl CraftingTableBlock {
+    /// Creates a new crafting table block behavior.
+    #[must_use]
+    pub const fn new(block: BlockRef) -> Self {
+        Self { block }
+    }
+}
+
+impl BlockBehavior for CraftingTableBlock {
+    fn get_state_for_placement(&self, _context: &BlockPlaceContext<'_>) -> Option<BlockStateId> {
+        Some(self.block.default_state())
+    }
+
+    fn use_without_item(
+        &self,
+        _state: BlockStateId,
+        _world: &Arc<World>,
+        pos: BlockPos,
+        player: &Player,
+        _hit_result: &BlockHitResult,
+        _inv: &mut InventoryAccess,
+    ) -> InteractionResult {
+        let inventory = Arc::clone(&player.inventory);
+        player.open_menu(
+            TextComponent::translated(translations::CONTAINER_CRAFTING.msg()),
+            move |context| crafting(inventory, context.container_id, pos),
+        );
+        player.award_custom_stat(&vanilla_custom_stats::INTERACT_WITH_CRAFTING_TABLE);
+        InteractionResult::Success
+    }
+}

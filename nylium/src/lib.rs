@@ -1,78 +1,110 @@
-use std::marker::PhantomData;
+//! Native Minecraft server administration with Ely. Backends publish state; views observe it.
 use std::sync::Arc;
 
-use gpui::*;
-use gpui_component::{Root, TitleBar};
-use nylium_adapter::NyliumServer;
-use nylium_assets::NyliumAssetSource;
+use gpui::{prelude::*, *};
+use nylium_adapter::{ServerAdapter, ServerSnapshot};
 
-mod actions;
-mod http_client;
-mod logger;
-mod ui;
+pub mod demo;
+mod field;
+mod http;
+mod window;
 
-use crate::http_client::HttpClient;
-use crate::ui::NyliumWindow;
+pub use ely;
+pub use gpui;
+pub use nylium_adapter;
 
-pub use crate::logger::NyliumLogger;
-
-pub struct Nylium<S, C, G>
-where
-    C: Copy,
-    G: Copy,
-    S: NyliumServer<C, G>,
-{
-    server: S,
-    logger: NyliumLogger,
-    _phantom: PhantomData<(C, G)>,
+/// A backend may register any GPUI view, not just a generated settings page.
+pub trait UiAdapter: ServerAdapter {
+    fn pages(&self, _window: &mut Window, _cx: &mut App) -> Vec<AdapterPage> {
+        Vec::new()
+    }
 }
 
-impl<S, C, G> Nylium<S, C, G>
-where
-    C: Copy + 'static,
-    G: Copy + 'static,
-    S: NyliumServer<C, G>,
-{
-    pub fn new(server: S, logger: NyliumLogger) -> Self {
+type PageUpdate = dyn Fn(Arc<ServerSnapshot>, &mut Window, &mut App);
+
+/// Stable ids must be unique and must not use the reserved `nylium.` prefix.
+pub struct AdapterPage {
+    pub id: String,
+    pub label: String,
+    view: AnyView,
+    update: Box<PageUpdate>,
+}
+
+impl AdapterPage {
+    /// `update` runs initially and on every backend invalidation, even while this page is hidden.
+    /// A page may also subscribe to its own adapter-specific event streams.
+    pub fn new<V: Render + 'static>(
+        id: impl Into<String>,
+        label: impl Into<String>,
+        view: Entity<V>,
+        update: impl Fn(&mut V, Arc<ServerSnapshot>, &mut Window, &mut Context<V>) + 'static,
+    ) -> Self {
+        let target = view.clone();
         Self {
-            server,
-            logger,
-            _phantom: PhantomData,
+            id: id.into(),
+            label: label.into(),
+            view: view.into(),
+            update: Box::new(move |snapshot, window, cx| {
+                target.update(cx, |view, cx| {
+                    update(view, snapshot, window, cx);
+                    cx.notify();
+                });
+            }),
         }
     }
+}
 
-    pub fn run(self) {
-        Application::new()
-            .with_assets(NyliumAssetSource)
-            .with_http_client(Arc::new(HttpClient::new()))
+pub struct Nylium;
+
+impl Nylium {
+    /// Starts the backend with the window and stops it before closing.
+    pub fn run(adapter: impl UiAdapter) {
+        let adapter = Arc::new(adapter);
+        gpui_platform::application()
+            .with_http_client(Arc::new(http::ImageHttpClient))
+            .with_assets(ely::Assets)
             .run(move |cx| {
-                gpui_component::init(cx);
-                cx.set_global(self.server);
-
-                // Stop server when closing Nylium
-                cx.on_app_quit(|cx| {
-                    let server = cx.global::<S>().clone();
-                    async move { server.stop().await }
-                })
-                .detach();
-
-                // Open Nylium window
-                let window_options = WindowOptions {
-                    titlebar: Some(TitleBar::title_bar_options()),
-                    window_bounds: Some(WindowBounds::centered(size(px(800.), px(500.)), cx)),
+                ely::init(cx).expect("Ely assets and fonts must load");
+                let options = WindowOptions {
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("Nylium".into()),
+                        appears_transparent: true,
+                        ..Default::default()
+                    }),
+                    window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
+                        None,
+                        size(px(1100.), px(760.)),
+                        cx,
+                    ))),
+                    window_min_size: Some(size(px(720.), px(480.))),
                     ..Default::default()
                 };
-                cx.open_window(window_options, |window, cx| {
-                    let view = cx.new(|cx| NyliumWindow::<S, C, G>::new(self.logger, window, cx));
-                    cx.new(|cx| Root::new(AnyView::from(view), window, cx))
+                let shutdown = adapter.clone();
+                cx.on_app_quit(move |_| {
+                    let shutdown = shutdown.clone();
+                    async move {
+                        if let Err(error) = shutdown.stop().await {
+                            eprintln!("Cannot stop server: {error}");
+                        }
+                    }
                 })
-                .unwrap();
-
-                // Start server
-                let server = cx.global::<S>().clone();
-                cx.background_executor()
-                    .spawn(async move { server.start().await })
-                    .detach();
+                .detach();
+                let backend: Arc<dyn ServerAdapter> = adapter.clone();
+                let window = cx.open_window(options, move |window, cx| {
+                    let pages = adapter.pages(window, cx);
+                    cx.new(|cx| window::ServerWindow::new(backend, pages, window, cx))
+                });
+                if let Err(error) = window {
+                    eprintln!("Cannot open Nylium: {error}");
+                    cx.quit();
+                }
+                cx.on_window_closed(|cx, _| {
+                    if cx.windows().is_empty() {
+                        cx.quit();
+                    }
+                })
+                .detach();
+                cx.activate(true);
             });
     }
 }

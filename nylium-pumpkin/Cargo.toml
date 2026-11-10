@@ -1,0 +1,44 @@
+[package]
+name = "nylium-pumpkin"
+default-run = "nylium-pumpkin"
+version = "0.1.0"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+description = "Embedded PumpkinMC adapter for Nylium"
+
+[dependencies]
+nylium = { path = "../nylium", optional = true }
+nylium-adapter = { path = "../nylium-adapter", features = ["console"] }
+async-trait = "0.1"
+smol = "2"
+tokio = { version = "1", features = ["rt-multi-thread", "sync", "time", "signal"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+chrono = "0.4"
+sysinfo = { version = "0.37", default-features = false, features = ["system"] }
+toml_edit = { version = "0.23", features = ["serde"] }
+tempfile = "3"
+tracing-log = "0.2"
+strip-ansi-escapes = "0.2"
+
+
+pumpkin-core = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "869f58d65059751f17744d349c700ea00166c4f2" }
+pumpkin-config = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "869f58d65059751f17744d349c700ea00166c4f2" }
+pumpkin-world = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "869f58d65059751f17744d349c700ea00166c4f2" }
+pumpkin-data = { git = "https://github.com/Pumpkin-MC/Pumpkin", rev = "869f58d65059751f17744d349c700ea00166c4f2" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+
+[dev-dependencies]
+log = "0.4"
+
+[workspace]
+
+[features]
+default = []
+ui = ["dep:nylium"]
+
+[[bin]]
+name = "nylium-pumpkin-ui"
+path = "src/gui.rs"
+required-features = ["ui"]
